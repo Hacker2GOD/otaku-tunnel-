@@ -2,7 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'package:file_picker/file_picker.dart';
+import 'package:cryptography/cryptography.dart' as cr;
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_v2ray/flutter_v2ray.dart';
@@ -37,12 +38,40 @@ class Cfg {
   String name;
   String link;
   bool hidden;
-  Cfg(this.name, this.link, this.hidden);
-  Map<String, dynamic> toJson() => {'name': name, 'link': link, 'hidden': hidden};
+  String expiry;
+  int limitMb;
+  int used;
+  String sub;
+  Cfg(this.name, this.link, this.hidden,
+      {this.expiry = '', this.limitMb = 0, this.used = 0, this.sub = ''});
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'link': link,
+        'hidden': hidden,
+        'expiry': expiry,
+        'limitMb': limitMb,
+      };
+  Map<String, dynamic> toStore() => {...toJson(), 'used': used, 'sub': sub};
+
   factory Cfg.fromJson(Map<String, dynamic> j) => Cfg(
-      (j['name'] ?? '').toString(),
-      (j['link'] ?? '').toString(),
-      j['hidden'] == true);
+        (j['name'] ?? '').toString(),
+        (j['link'] ?? '').toString(),
+        j['hidden'] == true,
+        expiry: (j['expiry'] ?? '').toString(),
+        limitMb: num.tryParse('${j['limitMb'] ?? 0}')?.toInt() ?? 0,
+        used: num.tryParse('${j['used'] ?? 0}')?.toInt() ?? 0,
+        sub: (j['sub'] ?? '').toString(),
+      );
+
+  bool get expired {
+    if (expiry.isEmpty) return false;
+    final d = DateTime.tryParse(expiry);
+    if (d == null) return false;
+    return DateTime.now().isAfter(d.add(const Duration(days: 1)));
+  }
+
+  bool get overLimit => limitMb > 0 && used >= limitMb * 1048576;
 }
 
 String fmtSpeed(num b) {
@@ -59,6 +88,42 @@ String fmtBytes(num b) {
 }
 
 int toInt(dynamic v) => num.tryParse('$v')?.toInt() ?? 0;
+
+List<double> hueMatrix(double deg) {
+  final r = deg * pi / 180;
+  final c = cos(r), s = sin(r);
+  return <double>[
+    0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928, 0, 0,
+    0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140, 0.072 - c * 0.072 - s * 0.283, 0, 0,
+    0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072, 0, 0,
+    0, 0, 0, 1, 0,
+  ];
+}
+
+// ---------- Chiffrement des fichiers .otaku ----------
+cr.Pbkdf2 _kdf() =>
+    cr.Pbkdf2(macAlgorithm: cr.Hmac.sha256(), iterations: 50000, bits: 256);
+
+Future<String> encryptText(String plain, String pw) async {
+  final salt = List<int>.generate(16, (_) => Random.secure().nextInt(256));
+  final key = await _kdf().deriveKeyFromPassword(password: pw, nonce: salt);
+  final box = await cr.AesGcm.with256bits().encrypt(utf8.encode(plain), secretKey: key);
+  return 'OTAKU2:${base64Encode([...salt, ...box.concatenation()])}';
+}
+
+Future<String?> decryptText(String data, String pw) async {
+  try {
+    final bytes = base64Decode(data);
+    final salt = bytes.sublist(0, 16);
+    final box = cr.SecretBox.fromConcatenation(bytes.sublist(16),
+        nonceLength: 12, macLength: 16);
+    final key = await _kdf().deriveKeyFromPassword(password: pw, nonce: salt);
+    final clear = await cr.AesGcm.with256bits().decrypt(box, secretKey: key);
+    return utf8.decode(clear);
+  } catch (_) {
+    return null;
+  }
+}
 
 class Spark extends CustomPainter {
   final List<double> d;
@@ -154,15 +219,22 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   final Map<int, int> pings = {};
   final List<String> logs = [];
   final List<double> hist = [];
-  int dlSpeed = 0, upSpeed = 0, dlTotal = 0, upTotal = 0;
+  final Map<String, int> usage = {};
+  List<Map<String, dynamic>> subs = [];
+  int dlSpeed = 0, upSpeed = 0, dlTotal = 0, upTotal = 0, lastTot = 0, tick = 0;
   String duration = '00:00:00';
-  bool wantOn = false, searching = false;
+  bool wantOn = false, searching = false, testing = false;
+  double? speedMbps;
   int retries = 0;
   bool turbo = false, autoReco = true, autoBest = false, proxyOnly = false;
+  bool autoConnect = false, mangekyoColor = true;
   String dns = 'auto';
+  String excluded = '';
 
   bool get connected => state == 'CONNECTED';
   bool get busy => state == 'CONNECTING' || searching;
+  List<String> get excludedApps =>
+      excluded.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
 
   @override
   void initState() {
@@ -181,8 +253,13 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         if (connected) {
           hist.add(dlSpeed.toDouble());
           if (hist.length > 40) hist.removeAt(0);
+          final tot = dlTotal + upTotal;
+          final delta = tot - lastTot;
+          if (delta > 0) _account(delta);
+          lastTot = tot;
         } else {
           hist.clear();
+          lastTot = 0;
         }
         if (prev != state) {
           log(state);
@@ -198,14 +275,39 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   void log(String m) =>
       logs.add('${DateTime.now().toIso8601String().substring(11, 19)}  $m');
 
+  String _today() => DateTime.now().toIso8601String().substring(0, 10);
+
+  void _account(int delta) {
+    if (sel < configs.length) configs[sel].used += delta;
+    final k = _today();
+    usage[k] = (usage[k] ?? 0) + delta;
+    tick++;
+    if (tick % 15 == 0) {
+      _save();
+      _saveUsage();
+    }
+    if (sel < configs.length && configs[sel].overLimit && wantOn) {
+      wantOn = false;
+      v2ray.stopV2Ray();
+      log('Limite de données atteinte');
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) snack('Limite de données atteinte : déconnexion');
+      });
+    }
+  }
+
   void _onState(String now) {
     if (now == 'CONNECTED') retries = 0;
-    if (now == 'DISCONNECTED' && wantOn && autoReco && retries < 3) {
-      retries++;
-      log('Reconnexion automatique ($retries/3)');
-      Future.delayed(const Duration(seconds: 2), () {
-        if (mounted && wantOn && state == 'DISCONNECTED') _start(skipBest: true);
-      });
+    if (now == 'DISCONNECTED') {
+      _save();
+      _saveUsage();
+      if (wantOn && autoReco && retries < 3) {
+        retries++;
+        log('Reconnexion automatique ($retries/3)');
+        Future.delayed(const Duration(seconds: 2), () {
+          if (mounted && wantOn && state == 'DISCONNECTED') _start(skipBest: true);
+        });
+      }
     }
   }
 
@@ -226,8 +328,24 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         if (q != null) l.add(Cfg(q.remark, s, false));
       }
     }
+    final u = <String, int>{};
+    try {
+      final m = jsonDecode(p.getString('usage') ?? '{}') as Map<String, dynamic>;
+      m.forEach((k, v) => u[k] = toInt(v));
+    } catch (_) {}
+    final sb = <Map<String, dynamic>>[];
+    try {
+      for (final e in (jsonDecode(p.getString('subs') ?? '[]') as List)) {
+        sb.add(Map<String, dynamic>.from(e as Map));
+      }
+    } catch (_) {}
+    if (!mounted) return;
     setState(() {
       configs = l;
+      usage
+        ..clear()
+        ..addAll(u);
+      subs = sb;
       sel = p.getInt('sel') ?? 0;
       if (sel >= configs.length) sel = 0;
       turbo = p.getBool('turbo') ?? false;
@@ -235,13 +353,35 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       autoReco = p.getBool('autoReco') ?? true;
       autoBest = p.getBool('autoBest') ?? false;
       proxyOnly = p.getBool('proxyOnly') ?? false;
+      autoConnect = p.getBool('autoConnect') ?? false;
+      mangekyoColor = p.getBool('mangekyoColor') ?? true;
+      excluded = p.getString('excluded') ?? '';
     });
+    if (subs.isNotEmpty) await updateSubs(quiet: true);
+    if (autoConnect && configs.isNotEmpty && mounted) {
+      wantOn = true;
+      await _start();
+    }
   }
 
   Future<void> _save() async {
     final p = await SharedPreferences.getInstance();
-    await p.setStringList('cfgs2', configs.map((c) => jsonEncode(c.toJson())).toList());
+    await p.setStringList('cfgs2', configs.map((c) => jsonEncode(c.toStore())).toList());
     await p.setInt('sel', sel);
+  }
+
+  Future<void> _saveUsage() async {
+    final p = await SharedPreferences.getInstance();
+    final keys = usage.keys.toList()..sort();
+    while (keys.length > 30) {
+      usage.remove(keys.removeAt(0));
+    }
+    await p.setString('usage', jsonEncode(usage));
+  }
+
+  Future<void> _saveSubs() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString('subs', jsonEncode(subs));
   }
 
   Future<void> _saveSettings() async {
@@ -251,10 +391,15 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     await p.setBool('autoReco', autoReco);
     await p.setBool('autoBest', autoBest);
     await p.setBool('proxyOnly', proxyOnly);
+    await p.setBool('autoConnect', autoConnect);
+    await p.setBool('mangekyoColor', mangekyoColor);
+    await p.setString('excluded', excluded);
   }
 
-  void snack(String m) =>
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  void snack(String m) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  }
 
   // ----- Outils -----
   String proto(String link) {
@@ -316,6 +461,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     snack('Recherche du meilleur serveur...');
     var bestI = -1, bestD = 1 << 30;
     for (var i = 0; i < configs.length; i++) {
+      if (configs[i].expired || configs[i].overLimit) continue;
       final d = await _delay(i);
       pings[i] = d;
       if (d > 0 && d < bestD) {
@@ -337,15 +483,19 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   Future<void> _start({bool skipBest = false}) async {
     if (configs.isEmpty) return snack('Ajoute d\'abord une config (onglet Configs)');
     if (autoBest && !skipBest && configs.length > 1) await bestServer();
-    final p = parse(configs[sel].link);
+    final c = configs[sel];
+    if (c.expired) return snack('Cette config est expirée');
+    if (c.overLimit) return snack('Limite de données atteinte pour cette config');
+    final p = parse(c.link);
     if (p == null) return snack('Config invalide');
     if (await v2ray.requestPermission()) {
+      final apps = excludedApps;
       v2ray.startV2Ray(
-        remark: configs[sel].name,
+        remark: c.name,
         config: buildConfig(p),
         proxyOnly: proxyOnly,
         bypassSubnets: null,
-        blockedApps: null,
+        blockedApps: apps.isEmpty ? null : apps,
       );
     }
   }
@@ -369,41 +519,225 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     setState(() => pings[sel] = d);
   }
 
-  // ----- Import / export -----
-  List<Cfg> parseImport(String input, bool forceHidden) {
-    final text = input.trim();
-    final out = <Cfg>[];
-    if (text.startsWith('OTAKU1:')) {
+  Future<void> speedTest() async {
+    if (testing) return;
+    setState(() {
+      testing = true;
+      speedMbps = null;
+    });
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    double res = -1;
+    try {
+      final sw = Stopwatch()..start();
+      final req = await client
+          .getUrl(Uri.parse('https://speed.cloudflare.com/__down?bytes=10000000'));
+      final r = await req.close();
+      var n = 0;
+      await for (final chunk in r) {
+        n += chunk.length;
+        if (sw.elapsed.inSeconds >= 10) break;
+      }
+      final secs = max(sw.elapsedMilliseconds / 1000, 0.001);
+      res = n * 8 / 1000000 / secs;
+    } catch (_) {
+      res = -1;
+    } finally {
+      client.close(force: true);
+    }
+    if (!mounted) return;
+    setState(() {
+      testing = false;
+      speedMbps = res;
+    });
+  }
+
+  // ----- Abonnements -----
+  Future<void> updateSubs({bool quiet = false}) async {
+    var n = 0;
+    for (final s in List<Map<String, dynamic>>.from(subs)) {
+      final url = '${s['url']}';
       try {
-        final j = jsonDecode(utf8.decode(base64Decode(text.substring(7).trim())))
-            as Map<String, dynamic>;
-        for (final c in (j['configs'] as List)) {
-          final cf = Cfg.fromJson(Map<String, dynamic>.from(c as Map));
-          if (parse(cf.link) != null) {
-            if (forceHidden) cf.hidden = true;
-            out.add(cf);
+        final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+        final req = await client.getUrl(Uri.parse(url));
+        final res = await req.close();
+        var body = (await res.transform(utf8.decoder).join()).trim();
+        client.close();
+        if (!body.contains('://')) {
+          try {
+            body = utf8.decode(base64Decode(base64.normalize(body)));
+          } catch (_) {}
+        }
+        final list = _linesToCfgs(body, s['hidden'] == true);
+        if (list.isNotEmpty) {
+          for (final c in list) {
+            c.sub = url;
           }
+          if (!mounted) return;
+          setState(() {
+            configs.removeWhere((c) => c.sub == url);
+            configs.addAll(list);
+            if (sel >= configs.length) sel = 0;
+          });
+          n += list.length;
         }
       } catch (_) {}
-      return out;
     }
+    _save();
+    if (!quiet) snack(n > 0 ? '$n config(s) mises à jour' : 'Aucune mise à jour');
+  }
+
+  Future<void> addSub() async {
+    final c = TextEditingController();
+    var hide = false;
+    await showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: const Text('Ajouter un abonnement'),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              TextField(
+                  controller: c,
+                  decoration: const InputDecoration(hintText: 'https://...')),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Cacher les infos'),
+                value: hide,
+                onChanged: (v) => setD(() => hide = v),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
+            FilledButton(
+              onPressed: () {
+                final u = c.text.trim();
+                if (!u.startsWith('http')) return snack('Lien invalide');
+                setState(() => subs.add({'url': u, 'hidden': hide}));
+                _saveSubs();
+                Navigator.pop(ctx);
+                updateSubs();
+              },
+              style: FilledButton.styleFrom(backgroundColor: kRed),
+              child: const Text('Ajouter'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ----- Import / export -----
+  List<Cfg> _linesToCfgs(String text, bool hide) {
+    final out = <Cfg>[];
     for (final l in text.split(RegExp(r'[\r\n]+'))) {
       final t = l.trim();
       if (t.contains('://')) {
         final p = parse(t);
-        if (p != null) out.add(Cfg(p.remark, t, forceHidden));
+        if (p != null) out.add(Cfg(p.remark, t, hide));
       }
     }
     return out;
   }
 
-  String exportText(List<Cfg> list) {
-    final j = {
-      'otaku': 1,
+  List<Cfg> _fromJson(String s, bool forceHidden) {
+    final out = <Cfg>[];
+    try {
+      final j = jsonDecode(s) as Map<String, dynamic>;
+      for (final c in (j['configs'] as List)) {
+        final cf = Cfg.fromJson(Map<String, dynamic>.from(c as Map));
+        cf.used = 0;
+        cf.sub = '';
+        if (parse(cf.link) != null) {
+          if (forceHidden) cf.hidden = true;
+          out.add(cf);
+        }
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  Future<List<Cfg>> parseImport(String input, bool forceHidden) async {
+    final text = input.trim();
+    if (text.startsWith('OTAKU2:')) {
+      final pw = await askText('Mot de passe du fichier', 'Mot de passe', obscure: true);
+      if (pw == null) return [];
+      final clear = await decryptText(text.substring(7).trim(), pw);
+      if (clear == null) {
+        snack('Mot de passe incorrect');
+        return [];
+      }
+      return _fromJson(clear, forceHidden);
+    }
+    if (text.startsWith('OTAKU1:')) {
+      try {
+        return _fromJson(utf8.decode(base64Decode(text.substring(7).trim())), forceHidden);
+      } catch (_) {
+        return [];
+      }
+    }
+    return _linesToCfgs(text, forceHidden);
+  }
+
+  Future<String> exportText(List<Cfg> list, {String password = ''}) async {
+    final j = jsonEncode({
+      'otaku': 2,
       'creator': 'APPOH GODWIN',
       'configs': list.map((c) => c.toJson()).toList()
-    };
-    return 'OTAKU1:${base64Encode(utf8.encode(jsonEncode(j)))}';
+    });
+    if (password.isNotEmpty) return encryptText(j, password);
+    return 'OTAKU1:${base64Encode(utf8.encode(j))}';
+  }
+
+  Future<String?> askText(String title, String hint, {bool obscure = false}) {
+    final c = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+            controller: c,
+            obscureText: obscure,
+            decoration: InputDecoration(hintText: hint)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, c.text),
+            style: FilledButton.styleFrom(backgroundColor: kRed),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<String?> prepareExport(List<Cfg> list) async {
+    final pw = await askText(
+        'Mot de passe (facultatif)', 'Laisse vide pour ne pas chiffrer',
+        obscure: true);
+    if (pw == null) return null;
+    return exportText(list, password: pw);
+  }
+
+  Future<void> copyCode(List<Cfg> list) async {
+    final txt = await prepareExport(list);
+    if (txt == null) return;
+    await Clipboard.setData(ClipboardData(text: txt));
+    snack('Code OTAKU copié');
+  }
+
+  Future<void> shareFile(List<Cfg> list, String name) async {
+    try {
+      final txt = await prepareExport(list);
+      if (txt == null) return;
+      final dir = await getTemporaryDirectory();
+      final safe = name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+      final f = File('${dir.path}/${safe.isEmpty ? 'config' : safe}.otaku');
+      await f.writeAsString(txt);
+      await Share.shareXFiles([XFile(f.path)], text: 'Config OTAKU TUNNEL');
+    } catch (_) {
+      snack('Partage impossible');
+    }
   }
 
   void _addImported(List<Cfg> l) {
@@ -416,31 +750,19 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 
   Future<void> importFile(bool hide) async {
     try {
-      final r = await FilePicker.platform.pickFiles(type: FileType.any);
-      if (r == null || r.files.single.path == null) return;
-      final txt = await File(r.files.single.path!).readAsString();
-      _addImported(parseImport(txt, hide));
+      final XFile? f = await openFile();
+      if (f == null) return;
+      final txt = await f.readAsString();
+      _addImported(await parseImport(txt, hide));
     } catch (_) {
       snack('Fichier illisible');
-    }
-  }
-
-  Future<void> shareFile(List<Cfg> list, String name) async {
-    try {
-      final dir = await getTemporaryDirectory();
-      final safe = name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-      final f = File('${dir.path}/${safe.isEmpty ? 'config' : safe}.otaku');
-      await f.writeAsString(exportText(list));
-      await Share.shareXFiles([XFile(f.path)], text: 'Config OTAKU TUNNEL');
-    } catch (_) {
-      snack('Partage impossible');
     }
   }
 
   Future<void> importDialog() async {
     final c = TextEditingController();
     final clip = (await Clipboard.getData('text/plain'))?.text ?? '';
-    if (clip.contains('://') || clip.startsWith('OTAKU1:')) c.text = clip.trim();
+    if (clip.contains('://') || clip.startsWith('OTAKU')) c.text = clip.trim();
     var hide = false;
     if (!mounted) return;
     await showDialog(
@@ -454,7 +776,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                 controller: c,
                 maxLines: 4,
                 decoration: const InputDecoration(
-                    hintText: 'Lien (vless://, vmess://...) ou code OTAKU1:'),
+                    hintText: 'Lien (vless://, vmess://...) ou code OTAKU'),
               ),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
@@ -476,9 +798,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
             FilledButton(
-              onPressed: () {
-                _addImported(parseImport(c.text, hide));
+              onPressed: () async {
                 Navigator.pop(ctx);
+                _addImported(await parseImport(c.text, hide));
               },
               style: FilledButton.styleFrom(backgroundColor: kRed),
               child: const Text('Importer'),
@@ -493,6 +815,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final c = configs[i];
     final n = TextEditingController(text: c.name);
     final l = TextEditingController(text: c.link);
+    final e = TextEditingController(text: c.expiry);
+    final m = TextEditingController(text: c.limitMb > 0 ? '${c.limitMb}' : '');
     await showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -503,8 +827,19 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             const SizedBox(height: 8),
             TextField(
                 controller: l,
-                maxLines: 4,
+                maxLines: 3,
                 decoration: const InputDecoration(labelText: 'Lien')),
+            const SizedBox(height: 8),
+            TextField(
+                controller: e,
+                decoration: const InputDecoration(
+                    labelText: 'Expire le (AAAA-MM-JJ, facultatif)')),
+            const SizedBox(height: 8),
+            TextField(
+                controller: m,
+                keyboardType: TextInputType.number,
+                decoration:
+                    const InputDecoration(labelText: 'Limite de données en Mo (0 = aucune)')),
           ]),
         ),
         actions: [
@@ -512,9 +847,15 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           FilledButton(
             onPressed: () {
               if (parse(l.text.trim()) == null) return snack('Lien invalide');
+              final ex = e.text.trim();
+              if (ex.isNotEmpty && DateTime.tryParse(ex) == null) {
+                return snack('Date invalide (ex : 2026-12-31)');
+              }
               setState(() {
                 if (n.text.trim().isNotEmpty) c.name = n.text.trim();
                 c.link = l.text.trim();
+                c.expiry = ex;
+                c.limitMb = int.tryParse(m.text.trim()) ?? 0;
                 pings.clear();
               });
               _save();
@@ -537,16 +878,18 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       setState(() => pings[i] = d);
     } else if (v == 'edit') {
       await editDialog(i);
+    } else if (v == 'resetuse') {
+      setState(() => c.used = 0);
+      _save();
     } else if (v == 'copylink') {
       await Clipboard.setData(ClipboardData(text: c.link));
       snack('Lien copié');
     } else if (v == 'copycode') {
-      await Clipboard.setData(ClipboardData(text: exportText([c])));
-      snack('Code OTAKU copié');
+      await copyCode([c]);
     } else if (v == 'share') {
       await shareFile([c], c.name);
     } else if (v == 'sharelock') {
-      await shareFile([Cfg(c.name, c.link, true)], c.name);
+      await shareFile([Cfg(c.name, c.link, true, expiry: c.expiry, limitMb: c.limitMb)], c.name);
     } else if (v == 'del') {
       setState(() {
         configs.removeAt(i);
@@ -555,6 +898,126 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       });
       _save();
     }
+  }
+
+  // ----- Fenêtres des réglages -----
+  Future<void> excludeDialog() async {
+    final c = TextEditingController(text: excluded);
+    const presets = {
+      'Telegram': 'org.telegram.messenger',
+      'WhatsApp': 'com.whatsapp',
+      'YouTube': 'com.google.android.youtube',
+      'TikTok': 'com.zhiliaoapp.musically',
+      'Facebook': 'com.facebook.katana',
+      'Instagram': 'com.instagram.android',
+    };
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Applis hors VPN'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text('Ces applis utilisent ta connexion directe, sans passer par le VPN.',
+                style: TextStyle(color: Colors.white60, fontSize: 12)),
+            const SizedBox(height: 8),
+            TextField(
+              controller: c,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                  hintText: 'noms de paquet séparés par des virgules'),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              children: presets.entries
+                  .map((e) => ActionChip(
+                        label: Text(e.key),
+                        onPressed: () {
+                          final cur = c.text.trim();
+                          final has = cur.split(',').map((x) => x.trim()).contains(e.value);
+                          if (!has) c.text = cur.isEmpty ? e.value : '$cur,${e.value}';
+                        },
+                      ))
+                  .toList(),
+            ),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
+          FilledButton(
+            onPressed: () {
+              setState(() => excluded = c.text.trim());
+              _saveSettings();
+              Navigator.pop(ctx);
+            },
+            style: FilledButton.styleFrom(backgroundColor: kRed),
+            child: const Text('Enregistrer'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void killSwitchInfo() => showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Coupure de sécurité'),
+          content: const Text(
+              'Pour bloquer tout internet si le VPN tombe, active-le dans Android :\n\n'
+              'Réglages > Réseau et Internet > VPN > roue dentée à côté de OTAKU TUNNEL.\n\n'
+              'Active « VPN permanent » puis « Bloquer les connexions sans VPN ».\n\n'
+              'Les noms des menus varient selon les téléphones.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Compris'))
+          ],
+        ),
+      );
+
+  void usageDialog() {
+    final keys = usage.keys.toList()..sort((a, b) => b.compareTo(a));
+    final shown = keys.take(14).toList();
+    final mx = shown.isEmpty ? 1 : shown.map((k) => usage[k]!).reduce(max);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Consommation'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: shown.isEmpty
+              ? const Text('Aucune donnée pour le moment.')
+              : ListView(
+                  shrinkWrap: true,
+                  children: shown
+                      .map((k) => Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4),
+                            child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text('$k  •  ${fmtBytes(usage[k]!)}',
+                                      style: const TextStyle(fontSize: 12)),
+                                  const SizedBox(height: 2),
+                                  LinearProgressIndicator(
+                                      value: usage[k]! / mx,
+                                      color: kRed,
+                                      backgroundColor: Colors.white12),
+                                ]),
+                          ))
+                      .toList(),
+                ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer')),
+          TextButton(
+            onPressed: () {
+              setState(() => usage.clear());
+              _saveUsage();
+              Navigator.pop(ctx);
+            },
+            child: const Text('Effacer'),
+          ),
+        ],
+      ),
+    );
   }
 
   // ----- Onglet Connexion -----
@@ -592,13 +1055,39 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             width: double.infinity,
             child: CustomPaint(painter: Spark(List<double>.from(hist)))),
         const SizedBox(height: 4),
-        Text('Durée : $duration', style: const TextStyle(color: Colors.white54, fontSize: 12)),
+        Text('Durée : $duration',
+            style: const TextStyle(color: Colors.white54, fontSize: 12)),
       ]);
 
   String pingLabel(int? d) {
     if (d == null) return 'Tester le serveur';
     if (d == 0) return 'Test en cours...';
     return d > 0 ? '$d ms' : 'Injoignable';
+  }
+
+  String speedLabel() {
+    if (testing) return 'Test en cours...';
+    final s = speedMbps;
+    if (s == null) return 'Test de vitesse';
+    return s < 0 ? 'Test impossible' : '${s.toStringAsFixed(1)} Mb/s';
+  }
+
+  Widget eye() {
+    final deg = mangekyoColor ? [0.0, 260.0, 200.0, 120.0, 40.0, 310.0][sel % 6] : 0.0;
+    final glow = connected ? HSLColor.fromAHSL(1, deg, 0.85, 0.5).toColor() : kRed;
+    Widget img = Image.asset(
+        connected ? 'assets/images/mangekyo.png' : 'assets/images/sharingan.png');
+    if (connected && deg != 0) {
+      img = ColorFiltered(colorFilter: ColorFilter.matrix(hueMatrix(deg)), child: img);
+    }
+    return Container(
+      width: 190,
+      height: 190,
+      decoration: BoxDecoration(shape: BoxShape.circle, boxShadow: [
+        BoxShadow(color: glow.withOpacity(connected ? 0.8 : 0.3), blurRadius: 40),
+      ]),
+      child: img,
+    );
   }
 
   Widget connectionTab() {
@@ -636,19 +1125,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           const SizedBox(height: 16),
           GestureDetector(
             onTap: toggle,
-            child: RotationTransition(
-              turns: spin,
-              child: Container(
-                width: 190,
-                height: 190,
-                decoration: BoxDecoration(shape: BoxShape.circle, boxShadow: [
-                  BoxShadow(color: kRed.withOpacity(connected ? 0.8 : 0.3), blurRadius: 40),
-                ]),
-                child: Image.asset(connected
-                    ? 'assets/images/mangekyo.png'
-                    : 'assets/images/sharingan.png'),
-              ),
-            ),
+            child: RotationTransition(turns: spin, child: eye()),
           ),
           const SizedBox(height: 16),
           Text(statusText, style: const TextStyle(color: Colors.white70)),
@@ -661,6 +1138,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
               icon: const Icon(Icons.network_ping),
               label: Text(pingLabel(pings[sel])),
             ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: speedTest,
+            icon: const Icon(Icons.speed),
+            label: Text(speedLabel()),
+          ),
           const SizedBox(height: 16),
           Container(
             width: double.infinity,
@@ -683,6 +1166,21 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                     const SizedBox(height: 4),
                     Text(c.hidden ? 'Infos masquées' : p.address,
                         style: const TextStyle(color: Colors.white60)),
+                    if (c.limitMb > 0) ...[
+                      const SizedBox(height: 8),
+                      LinearProgressIndicator(
+                          value: min(c.used / (c.limitMb * 1048576), 1.0),
+                          color: kRed,
+                          backgroundColor: Colors.white12),
+                      const SizedBox(height: 4),
+                      Text('${fmtBytes(c.used)} / ${c.limitMb} Mo',
+                          style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                    ],
+                    if (c.expiry.isNotEmpty)
+                      Text(c.expired ? 'Expirée le ${c.expiry}' : 'Valide jusqu\'au ${c.expiry}',
+                          style: TextStyle(
+                              color: c.expired ? Colors.redAccent : Colors.white54,
+                              fontSize: 12)),
                   ]),
           ),
         ]),
@@ -695,6 +1193,22 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   }
 
   // ----- Onglet Configs -----
+  String subtitleFor(Cfg c, int i) {
+    final p = parse(c.link);
+    final d = pings[i];
+    final b = StringBuffer(c.hidden ? 'Infos masquées' : (p?.address ?? ''));
+    if (d != null) {
+      b.write(d > 0 ? '  •  $d ms' : d == 0 ? '  •  test...' : '  •  injoignable');
+    }
+    if (c.expired) {
+      b.write('  •  expirée');
+    } else if (c.expiry.isNotEmpty) {
+      b.write('  •  jusqu\'au ${c.expiry}');
+    }
+    if (c.limitMb > 0) b.write('  •  ${fmtBytes(c.used)}/${c.limitMb} Mo');
+    return b.toString();
+  }
+
   Widget configsTab() => Column(children: [
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 16, 8, 8),
@@ -702,9 +1216,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             const Text('Configs', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
             const Spacer(),
             IconButton(
-                tooltip: 'Meilleur serveur',
-                onPressed: bestServer,
-                icon: const Icon(Icons.bolt)),
+                tooltip: 'Meilleur serveur', onPressed: bestServer, icon: const Icon(Icons.bolt)),
             IconButton(
                 tooltip: 'Partager tout',
                 onPressed: () {
@@ -722,8 +1234,6 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                   itemCount: configs.length,
                   itemBuilder: (_, i) {
                     final c = configs[i];
-                    final p = parse(c.link);
-                    final d = pings[i];
                     return Card(
                       color: kCard,
                       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
@@ -739,11 +1249,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                               child: Text('${proto(c.link)}  ${c.name}',
                                   maxLines: 1, overflow: TextOverflow.ellipsis)),
                         ]),
-                        subtitle: Text(
-                            '${c.hidden ? 'Infos masquées' : (p?.address ?? '')}'
-                            '${d == null ? '' : d > 0 ? '  •  $d ms' : d == 0 ? '  •  test...' : '  •  injoignable'}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis),
+                        subtitle: Text(subtitleFor(c, i),
+                            maxLines: 2, overflow: TextOverflow.ellipsis),
                         onTap: () {
                           setState(() => sel = i);
                           _save();
@@ -754,6 +1261,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                             const PopupMenuItem(value: 'test', child: Text('Tester')),
                             if (!c.hidden)
                               const PopupMenuItem(value: 'edit', child: Text('Modifier')),
+                            if (c.limitMb > 0)
+                              const PopupMenuItem(
+                                  value: 'resetuse', child: Text('Remettre la conso à zéro')),
                             if (!c.hidden)
                               const PopupMenuItem(
                                   value: 'copylink', child: Text('Copier le lien')),
@@ -782,39 +1292,30 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                 color: kRed, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.5)),
       );
 
+  Widget sw(String title, String sub, bool v, void Function(bool) f) => SwitchListTile(
+        title: Text(title),
+        subtitle: Text(sub),
+        value: v,
+        onChanged: (x) {
+          setState(() => f(x));
+          _saveSettings();
+        },
+      );
+
   Widget settingsTab() => ListView(padding: const EdgeInsets.all(8), children: [
         const Padding(
             padding: EdgeInsets.all(8),
             child: Text('Réglages',
                 style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold))),
         sec('Vitesse et stabilité'),
-        SwitchListTile(
-          title: const Text('Mode Turbo'),
-          subtitle: const Text('Multiplexage : accélère pages et applis (à tester)'),
-          value: turbo,
-          onChanged: (v) {
-            setState(() => turbo = v);
-            _saveSettings();
-          },
-        ),
-        SwitchListTile(
-          title: const Text('Meilleur serveur automatique'),
-          subtitle: const Text('Teste tes configs avant de se connecter'),
-          value: autoBest,
-          onChanged: (v) {
-            setState(() => autoBest = v);
-            _saveSettings();
-          },
-        ),
-        SwitchListTile(
-          title: const Text('Reconnexion automatique'),
-          subtitle: const Text('Relance si la connexion tombe'),
-          value: autoReco,
-          onChanged: (v) {
-            setState(() => autoReco = v);
-            _saveSettings();
-          },
-        ),
+        sw('Mode Turbo', 'Multiplexage : accélère pages et applis (à tester)', turbo,
+            (v) => turbo = v),
+        sw('Meilleur serveur automatique', 'Teste tes configs avant de se connecter', autoBest,
+            (v) => autoBest = v),
+        sw('Reconnexion automatique', 'Relance si la connexion tombe', autoReco,
+            (v) => autoReco = v),
+        sw('Connexion au lancement', 'Se connecte quand tu ouvres l\'appli', autoConnect,
+            (v) => autoConnect = v),
         ListTile(
           title: const Text('Serveur DNS'),
           trailing: DropdownButton<String>(
@@ -832,17 +1333,65 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             },
           ),
         ),
-        sec('Mode'),
-        SwitchListTile(
-          title: const Text('Proxy seulement'),
-          subtitle: const Text('Sans VPN système (pour apps compatibles)'),
-          value: proxyOnly,
-          onChanged: (v) {
-            setState(() => proxyOnly = v);
-            _saveSettings();
-          },
+        sec('Mode et applis'),
+        sw('Proxy seulement', 'Sans VPN système (pour apps compatibles)', proxyOnly,
+            (v) => proxyOnly = v),
+        ListTile(
+          leading: const Icon(Icons.apps),
+          title: const Text('Applis hors VPN'),
+          subtitle: Text(excludedApps.isEmpty
+              ? 'Aucune'
+              : '${excludedApps.length} appli(s) en accès direct'),
+          onTap: excludeDialog,
         ),
+        sec('Sécurité'),
+        ListTile(
+          leading: const Icon(Icons.shield_moon_outlined),
+          title: const Text('Coupure de sécurité (kill switch)'),
+          subtitle: const Text('Comment bloquer internet si le VPN tombe'),
+          onTap: killSwitchInfo,
+        ),
+        sec('Apparence'),
+        sw('Mangekyō selon le serveur', 'Une couleur différente par config', mangekyoColor,
+            (v) => mangekyoColor = v),
+        sec('Abonnements'),
+        ListTile(
+          leading: const Icon(Icons.add_link),
+          title: const Text('Ajouter un abonnement'),
+          onTap: addSub,
+        ),
+        if (subs.isNotEmpty)
+          ListTile(
+            leading: const Icon(Icons.refresh),
+            title: const Text('Mettre à jour maintenant'),
+            onTap: () => updateSubs(),
+          ),
+        for (var i = 0; i < subs.length; i++)
+          ListTile(
+            dense: true,
+            title: Text('${subs[i]['url']}', maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(subs[i]['hidden'] == true ? 'Infos masquées' : 'Infos visibles'),
+            trailing: IconButton(
+              icon: const Icon(Icons.delete_outline),
+              onPressed: () {
+                final u = '${subs[i]['url']}';
+                setState(() {
+                  subs.removeAt(i);
+                  configs.removeWhere((c) => c.sub == u);
+                  if (sel >= configs.length) sel = 0;
+                });
+                _saveSubs();
+                _save();
+              },
+            ),
+          ),
         sec('Données'),
+        ListTile(
+          leading: const Icon(Icons.bar_chart),
+          title: const Text('Consommation'),
+          subtitle: const Text('Historique par jour'),
+          onTap: usageDialog,
+        ),
         ListTile(
           leading: const Icon(Icons.download),
           title: const Text('Importer des configs'),
@@ -859,10 +1408,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ListTile(
           leading: const Icon(Icons.copy),
           title: const Text('Copier toutes les configs (code OTAKU)'),
-          onTap: () async {
+          onTap: () {
             if (configs.isEmpty) return snack('Aucune config');
-            await Clipboard.setData(ClipboardData(text: exportText(configs)));
-            snack('Code copié');
+            copyCode(configs);
           },
         ),
         sec('Diagnostic'),
@@ -879,7 +1427,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v2.0'),
+          title: Text('OTAKU TUNNEL v3.0'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
