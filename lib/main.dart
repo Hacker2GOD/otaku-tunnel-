@@ -112,6 +112,11 @@ List<int> b64dec(String s) {
   return base64Decode(base64.normalize(t));
 }
 
+bool validDate(String s) {
+  final d = DateTime.tryParse(s);
+  return d != null && d.toIso8601String().substring(0, 10) == s;
+}
+
 // Lit un lien vmess/vless/trojan/ss et le transforme en champs modifiables.
 Map<String, String>? parseLink(String link) {
   final l = link.trim();
@@ -130,7 +135,7 @@ Map<String, String>? parseLink(String link) {
         'port': g('port', '443'),
         'id': g('id'),
         'aid': g('aid', '0'),
-        'scn': g('scn', 'auto'),
+        'scn': g('scy', g('scn', 'auto')),
         'net': g('net', 'tcp'),
         'type': g('type', 'none'),
         'host': g('host'),
@@ -139,6 +144,7 @@ Map<String, String>? parseLink(String link) {
         'sni': g('sni'),
         'alpn': g('alpn'),
         'fp': g('fp'),
+        'ins': g('allowInsecure'),
       };
     }
     if (l.startsWith('vless://') || l.startsWith('trojan://')) {
@@ -146,7 +152,7 @@ Map<String, String>? parseLink(String link) {
       final q = u.queryParameters;
       const known = {
         'type', 'security', 'host', 'path', 'sni', 'alpn', 'fp', 'flow', 'encryption',
-        'serviceName'
+        'serviceName', 'allowInsecure'
       };
       final f = <String, String>{
         'proto': u.scheme,
@@ -164,6 +170,7 @@ Map<String, String>? parseLink(String link) {
         'flow': q['flow'] ?? '',
         'enc': q['encryption'] ?? 'none',
         'svc': q['serviceName'] ?? '',
+        'ins': q['allowInsecure'] ?? '',
       };
       q.forEach((k, v) {
         if (!known.contains(k)) f['x_$k'] = v;
@@ -228,7 +235,7 @@ String? buildLink(Map<String, String> f) {
       'port': port,
       'id': f['id'] ?? '',
       'aid': int.tryParse(f['aid'] ?? '0') ?? 0,
-      'scn': (f['scn'] ?? '').isEmpty ? 'auto' : f['scn'],
+      'scy': (f['scn'] ?? '').isEmpty ? 'auto' : f['scn'],
       'net': f['net'] ?? 'tcp',
       'type': f['type'] ?? 'none',
       'host': f['host'] ?? '',
@@ -238,6 +245,7 @@ String? buildLink(Map<String, String> f) {
       'alpn': f['alpn'] ?? '',
       'fp': f['fp'] ?? '',
     };
+    if ((f['ins'] ?? '') == '1') j['allowInsecure'] = '1';
     return 'vmess://${base64Encode(utf8.encode(jsonEncode(j)))}';
   }
   if (p == 'vless' || p == 'trojan') {
@@ -256,6 +264,7 @@ String? buildLink(Map<String, String> f) {
     put('alpn', f['alpn']);
     put('fp', f['fp']);
     put('serviceName', f['svc']);
+    if ((f['ins'] ?? '') == '1') q['allowInsecure'] = '1';
     f.forEach((k, v) {
       if (k.startsWith('x_') && v.isNotEmpty) q[k.substring(2)] = v;
     });
@@ -290,6 +299,7 @@ class ConfigEditor extends StatefulWidget {
 class _ConfigEditorState extends State<ConfigEditor> {
   late String proto;
   String net = 'ws', tls = 'tls', vtype = 'none';
+  bool insecure = false;
   final Map<String, TextEditingController> c = {};
   final Map<String, String> extra = {};
   bool isNew = true;
@@ -317,6 +327,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
       net = f['net'] ?? 'tcp';
       tls = f['tls'] ?? '';
       vtype = f['type'] ?? 'none';
+      insecure = f['ins'] == '1' || f['ins'] == 'true';
       c['expiry']!.text = cf.expiry;
       c['limit']!.text = cf.limitMb > 0 ? '${cf.limitMb}' : '';
     } else {
@@ -344,6 +355,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
       f[k] = c[k]!.text.trim();
     }
     f.addAll(extra);
+    f['ins'] = insecure ? '1' : '';
     final link = buildLink(f);
     if (link == null) return _err('Le serveur cible est obligatoire');
     try {
@@ -352,7 +364,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
       return _err('Config invalide : vérifie les champs');
     }
     final ex = c['expiry']!.text.trim();
-    if (ex.isNotEmpty && DateTime.tryParse(ex) == null) {
+    if (ex.isNotEmpty && !validDate(ex)) {
       return _err('Date invalide (ex : 2026-12-31)');
     }
     final old = widget.cfg;
@@ -444,6 +456,14 @@ class _ConfigEditorState extends State<ConfigEditor> {
             field('sni', 'SNI (server name indication)'),
             field('alpn', 'ALPN (ex : h2,http/1.1)'),
             field('fp', 'Fingerprint (ex : chrome)'),
+            if (tls == 'tls' || tls == 'reality')
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Autoriser certificat non vérifié'),
+                subtitle: const Text('allowInsecure : utile si le SNI diffère du serveur'),
+                value: insecure,
+                onChanged: (v) => setState(() => insecure = v),
+              ),
             if (proto == 'vless') field('svc', 'Nom du service (gRPC)'),
           ],
           const Divider(),
@@ -591,6 +611,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   String excluded = '';
   int skin = 0;
   bool hotspot = false;
+  bool preResolve = true, autoHost = true;
 
   bool get connected => state == 'CONNECTED';
   bool get busy => state == 'CONNECTING' || searching;
@@ -662,7 +683,14 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   }
 
   void _onState(String now) {
-    if (now == 'CONNECTED') retries = 0;
+    if (now == 'CONNECTED') {
+      retries = 0;
+      Future.delayed(const Duration(seconds: 12), () {
+        if (mounted && connected && dlTotal + upTotal == 0) {
+          snack('Connecté mais aucun trafic détecté. Essaie Configs > Diagnostiquer.');
+        }
+      });
+    }
     if (now == 'DISCONNECTED') {
       _save();
       _saveUsage();
@@ -723,6 +751,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       excluded = p.getString('excluded') ?? '';
       skin = p.getInt('skin') ?? 0;
       hotspot = p.getBool('hotspot') ?? false;
+      preResolve = p.getBool('preResolve') ?? true;
+      autoHost = p.getBool('autoHost') ?? true;
     });
     try {
       final t = await kChan.invokeMethod<String>('getInitial');
@@ -767,6 +797,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     await p.setString('excluded', excluded);
     await p.setInt('skin', skin);
     await p.setBool('hotspot', hotspot);
+    await p.setBool('preResolve', preResolve);
+    await p.setBool('autoHost', autoHost);
   }
 
   void snack(String m) {
@@ -792,15 +824,70 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     }
   }
 
-  String buildConfig(V2RayURL p) {
+  // Construit la config du moteur : types corrigés, serveur résolu avec le DNS du
+  // téléphone, header host rempli, allowInsecure, Turbo, DNS et hotspot.
+  Future<String> buildConfig(V2RayURL p, String link) async {
     final raw = p.getFullConfiguration();
     try {
       final m = jsonDecode(raw) as Map<String, dynamic>;
-      if (turbo) {
-        final outs = m['outbounds'];
-        if (outs is List && outs.isNotEmpty && outs[0] is Map) {
-          (outs[0] as Map)['mux'] = {'enabled': true, 'concurrency': 8};
+      final lf = parseLink(link) ?? <String, String>{};
+      final outs = m['outbounds'];
+      if (outs is List && outs.isNotEmpty && outs[0] is Map) {
+        final o = outs[0] as Map;
+        final ss = o['streamSettings'];
+        if ((lf['ins'] == '1' || lf['ins'] == 'true') && ss is Map && ss['tlsSettings'] is Map) {
+          (ss['tlsSettings'] as Map)['allowInsecure'] = true;
         }
+        final st = o['settings'];
+        Map? target;
+        if (st is Map) {
+          final vn = st['vnext'];
+          final sv = st['servers'];
+          if (vn is List && vn.isNotEmpty && vn[0] is Map) {
+            target = vn[0] as Map;
+          } else if (sv is List && sv.isNotEmpty && sv[0] is Map) {
+            target = sv[0] as Map;
+          }
+        }
+        if (target != null) {
+          final pt = target['port'];
+          if (pt is String) target['port'] = int.tryParse(pt) ?? 443;
+          final us = target['users'];
+          if (us is List && us.isNotEmpty && us[0] is Map) {
+            final u = us[0] as Map;
+            final a = u['alterId'];
+            if (a is String) u['alterId'] = int.tryParse(a) ?? 0;
+          }
+          final addr = '${target['address']}';
+          if (InternetAddress.tryParse(addr) == null) {
+            if ((autoHost || preResolve) && ss is Map) {
+              final ws = ss['wsSettings'];
+              if (ws is Map) {
+                final h = ws['headers'];
+                if (h is Map) {
+                  if ('${h['Host'] ?? ''}'.isEmpty) h['Host'] = addr;
+                } else {
+                  ws['headers'] = {'Host': addr};
+                }
+              }
+              final tl = ss['tlsSettings'];
+              if (tl is Map && '${tl['serverName'] ?? ''}'.isEmpty) tl['serverName'] = addr;
+            }
+            if (preResolve) {
+              try {
+                final r = await InternetAddress.lookup(addr, type: InternetAddressType.IPv4)
+                    .timeout(const Duration(seconds: 5));
+                if (r.isNotEmpty) {
+                  target['address'] = r.first.address;
+                  log('Serveur résolu : $addr -> ${r.first.address}');
+                }
+              } catch (_) {
+                log('Résolution impossible : $addr');
+              }
+            }
+          }
+        }
+        if (turbo) o['mux'] = {'enabled': true, 'concurrency': 8};
       }
       if (dns != 'auto') {
         final servers = dns == 'cloudflare'
@@ -830,9 +917,10 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final p = parse(configs[i].link);
     if (p == null) return -1;
     try {
+      final cfgJson = await buildConfig(p, configs[i].link);
       return await v2ray
-          .getServerDelay(config: buildConfig(p))
-          .timeout(const Duration(seconds: 6));
+          .getServerDelay(config: cfgJson)
+          .timeout(const Duration(seconds: 8));
     } catch (_) {
       return -1;
     }
@@ -872,10 +960,11 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final p = parse(c.link);
     if (p == null) return snack('Config invalide');
     if (await v2ray.requestPermission()) {
+      final cfgJson = await buildConfig(p, c.link);
       final apps = excludedApps;
       v2ray.startV2Ray(
         remark: c.name,
-        config: buildConfig(p),
+        config: cfgJson,
         proxyOnly: proxyOnly,
         bypassSubnets: null,
         blockedApps: apps.isEmpty ? null : apps,
@@ -1231,7 +1320,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             onPressed: () {
               if (parse(l.text.trim()) == null) return snack('Lien invalide');
               final ex = e.text.trim();
-              if (ex.isNotEmpty && DateTime.tryParse(ex) == null) {
+              if (ex.isNotEmpty && !validDate(ex)) {
                 return snack('Date invalide (ex : 2026-12-31)');
               }
               setState(() {
@@ -1247,6 +1336,138 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             style: FilledButton.styleFrom(backgroundColor: kRed),
             child: const Text('Enregistrer'),
           ),
+        ],
+      ),
+    );
+  }
+
+  Future<String> _diagReport(Cfg c, int i) async {
+    final f = parseLink(c.link);
+    if (f == null) return 'Lien non lisible.';
+    final b = StringBuffer();
+    final add = f['add'] ?? '';
+    final port = int.tryParse(f['port'] ?? '') ?? 443;
+    final net = f['net'] ?? 'tcp';
+    final tls = (f['tls'] ?? '') == 'tls';
+    final host = f['host'] ?? '';
+    final path = (f['path'] ?? '').isEmpty ? '/' : f['path']!;
+    final sni = (f['sni'] ?? '').isNotEmpty ? f['sni']! : (host.isNotEmpty ? host : add);
+    b.writeln('Protocole : ${f['proto']}   Réseau : $net   TLS : ${tls ? 'oui' : 'non'}');
+    b.writeln('Cible : $add:$port');
+    b.writeln('Host : ${host.isEmpty ? '(vide, donc $add)' : host}');
+    b.writeln('SNI : $sni   Path : $path');
+    b.writeln('');
+    var ip = add;
+    var sw = Stopwatch()..start();
+    try {
+      final r = await InternetAddress.lookup(add, type: InternetAddressType.IPv4)
+          .timeout(const Duration(seconds: 6));
+      ip = r.first.address;
+      b.writeln('1. DNS : OK -> $ip (${sw.elapsedMilliseconds} ms)');
+    } catch (_) {
+      b.writeln('1. DNS : ECHEC (le téléphone ne trouve pas ce serveur)');
+      return b.toString();
+    }
+    Socket? sock;
+    try {
+      sw = Stopwatch()..start();
+      sock = await Socket.connect(ip, port, timeout: const Duration(seconds: 8));
+      b.writeln('2. Connexion TCP : OK (${sw.elapsedMilliseconds} ms)');
+      if (tls) {
+        sock = await SecureSocket.secure(sock, host: sni, onBadCertificate: (_) => true);
+        b.writeln('3. TLS : OK (SNI $sni)');
+      }
+      if (net == 'ws') {
+        final key = base64Encode(List<int>.generate(16, (_) => Random().nextInt(256)));
+        sock.write('GET $path HTTP/1.1\r\nHost: ${host.isEmpty ? add : host}\r\n'
+            'Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $key\r\n'
+            'Sec-WebSocket-Version: 13\r\n\r\n');
+        final data = await sock.first.timeout(const Duration(seconds: 8));
+        final line = utf8.decode(data, allowMalformed: true).split('\r\n').first;
+        b.writeln('4. WebSocket : $line');
+        b.writeln(line.contains('101')
+            ? '=> Le serveur accepte ce Host et ce Path.'
+            : '=> Le serveur refuse : change le Host, le Path ou le port.');
+      } else {
+        b.writeln('(Test WebSocket ignoré : réseau $net)');
+      }
+    } catch (e) {
+      b.writeln('ECHEC : ${e.runtimeType} ${e.toString().split('\n').first}');
+    } finally {
+      sock?.destroy();
+    }
+    final d = await _delay(i);
+    b.writeln('5. Test du moteur : ${d > 0 ? '$d ms' : 'echec'}');
+    return b.toString();
+  }
+
+  Future<void> diagnose(Cfg c, int i) async {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(children: [
+          CircularProgressIndicator(),
+          SizedBox(width: 16),
+          Expanded(child: Text('Diagnostic en cours...')),
+        ]),
+      ),
+    );
+    final report = await _diagReport(c, i);
+    if (!mounted) return;
+    Navigator.of(context).pop();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Diagnostic'),
+        content: SingleChildScrollView(child: SelectableText(report)),
+        actions: [
+          TextButton(
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: report));
+                snack('Rapport copié');
+              },
+              child: const Text('Copier')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer')),
+        ],
+      ),
+    );
+  }
+
+  Future<void> engineView(int i) async {
+    final cfg = parse(configs[i].link);
+    if (cfg == null) return snack('Config invalide');
+    final built = await buildConfig(cfg, configs[i].link);
+    String txt;
+    try {
+      txt = JsonEncoder.withIndent('  ').convert(jsonDecode(built));
+    } catch (_) {
+      txt = built;
+    }
+    final masked = txt.replaceAll(
+        RegExp(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'),
+        'UUID');
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Config du moteur'),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 380,
+          child: SingleChildScrollView(
+            child: SelectableText(txt, style: const TextStyle(fontSize: 11)),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: masked));
+              snack('JSON copié (UUID masqué)');
+            },
+            child: const Text('Copier (UUID masqué)'),
+          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer')),
         ],
       ),
     );
@@ -1387,7 +1608,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final ports = <String>[];
     if (cfg != null) {
       try {
-        final m = jsonDecode(buildConfig(cfg)) as Map<String, dynamic>;
+        final m = jsonDecode(await buildConfig(cfg, configs[sel].link)) as Map<String, dynamic>;
         for (final i in (m['inbounds'] as List)) {
           if (i is Map && (i['protocol'] == 'http' || i['protocol'] == 'socks')) {
             ports.add('${i['protocol']} : ${i['port']}');
@@ -1431,6 +1652,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       final d = await _delay(i);
       if (!mounted) return;
       setState(() => pings[i] = d);
+    } else if (v == 'diag') {
+      await diagnose(c, i);
     } else if (v == 'edit') {
       if (parseLink(c.link) == null) {
         await editDialog(i);
@@ -1445,6 +1668,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           _save();
         }
       }
+    } else if (v == 'engine') {
+      await engineView(i);
     } else if (v == 'resetuse') {
       setState(() => c.used = 0);
       _save();
@@ -1845,7 +2070,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                           itemBuilder: (_) => [
                             const PopupMenuItem(value: 'test', child: Text('Tester')),
                             if (!c.hidden)
+                              const PopupMenuItem(value: 'diag', child: Text('Diagnostiquer')),
+                            if (!c.hidden)
                               const PopupMenuItem(value: 'edit', child: Text('Modifier')),
+                            if (!c.hidden)
+                              const PopupMenuItem(
+                                  value: 'engine', child: Text('Voir la config du moteur')),
                             if (c.limitMb > 0)
                               const PopupMenuItem(
                                   value: 'resetuse', child: Text('Remettre la conso à zéro')),
@@ -1918,6 +2148,10 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             },
           ),
         ),
+        sw('Résoudre le serveur avant connexion',
+            'Corrige les cas « connecté mais rien ne passe »', preResolve, (v) => preResolve = v),
+        sw('Host automatique', 'Remplit un header host vide avec l\'adresse du serveur', autoHost,
+            (v) => autoHost = v),
         sec('Mode et applis'),
         sw('Proxy seulement', 'Sans VPN système (pour apps compatibles)', proxyOnly,
             (v) => proxyOnly = v),
@@ -2026,7 +2260,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v4.0'),
+          title: Text('OTAKU TUNNEL v4.1'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
