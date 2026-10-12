@@ -100,6 +100,365 @@ List<double> hueMatrix(double deg) {
   ];
 }
 
+
+const kChan = MethodChannel('otaku/intent');
+
+String skinAsset(int s) => s == 0
+    ? 'assets/images/mangekyo.png'
+    : 'assets/images/skins/s${s.toString().padLeft(2, '0')}.png';
+
+List<int> b64dec(String s) {
+  final t = s.trim().replaceAll('-', '+').replaceAll('_', '/');
+  return base64Decode(base64.normalize(t));
+}
+
+// Lit un lien vmess/vless/trojan/ss et le transforme en champs modifiables.
+Map<String, String>? parseLink(String link) {
+  final l = link.trim();
+  try {
+    if (l.startsWith('vmess://')) {
+      final j = jsonDecode(utf8.decode(b64dec(l.substring(8)))) as Map<String, dynamic>;
+      String g(String k, [String d = '']) {
+        final v = j[k];
+        return (v == null || '$v'.isEmpty) ? d : '$v';
+      }
+
+      return {
+        'proto': 'vmess',
+        'remark': g('ps'),
+        'add': g('add'),
+        'port': g('port', '443'),
+        'id': g('id'),
+        'aid': g('aid', '0'),
+        'scn': g('scn', 'auto'),
+        'net': g('net', 'tcp'),
+        'type': g('type', 'none'),
+        'host': g('host'),
+        'path': g('path'),
+        'tls': g('tls'),
+        'sni': g('sni'),
+        'alpn': g('alpn'),
+        'fp': g('fp'),
+      };
+    }
+    if (l.startsWith('vless://') || l.startsWith('trojan://')) {
+      final u = Uri.parse(l);
+      final q = u.queryParameters;
+      const known = {
+        'type', 'security', 'host', 'path', 'sni', 'alpn', 'fp', 'flow', 'encryption',
+        'serviceName'
+      };
+      final f = <String, String>{
+        'proto': u.scheme,
+        'remark': Uri.decodeComponent(u.fragment),
+        'add': u.host,
+        'port': '${u.hasPort ? u.port : 443}',
+        'id': Uri.decodeComponent(u.userInfo),
+        'net': q['type'] ?? 'tcp',
+        'tls': q['security'] ?? 'none',
+        'host': q['host'] ?? '',
+        'path': q['path'] ?? '',
+        'sni': q['sni'] ?? '',
+        'alpn': q['alpn'] ?? '',
+        'fp': q['fp'] ?? '',
+        'flow': q['flow'] ?? '',
+        'enc': q['encryption'] ?? 'none',
+        'svc': q['serviceName'] ?? '',
+      };
+      q.forEach((k, v) {
+        if (!known.contains(k)) f['x_$k'] = v;
+      });
+      return f;
+    }
+    if (l.startsWith('ss://')) {
+      var rest = l.substring(5);
+      var remark = '';
+      final h = rest.indexOf('#');
+      if (h >= 0) {
+        remark = Uri.decodeComponent(rest.substring(h + 1));
+        rest = rest.substring(0, h);
+      }
+      var raw = '';
+      final qm = rest.indexOf('?');
+      if (qm >= 0) {
+        raw = rest.substring(qm + 1);
+        rest = rest.substring(0, qm);
+      }
+      String cred;
+      String hostPort;
+      if (rest.contains('@')) {
+        final at = rest.lastIndexOf('@');
+        var ui = Uri.decodeComponent(rest.substring(0, at));
+        hostPort = rest.substring(at + 1);
+        if (!ui.contains(':')) ui = utf8.decode(b64dec(ui));
+        cred = ui;
+      } else {
+        final d = utf8.decode(b64dec(rest));
+        final at = d.lastIndexOf('@');
+        cred = d.substring(0, at);
+        hostPort = d.substring(at + 1);
+      }
+      final c = cred.indexOf(':');
+      final colon = hostPort.lastIndexOf(':');
+      return {
+        'proto': 'ss',
+        'remark': remark,
+        'add': hostPort.substring(0, colon),
+        'port': hostPort.substring(colon + 1).replaceAll('/', ''),
+        'method': cred.substring(0, c),
+        'id': cred.substring(c + 1),
+        'x_raw': raw,
+      };
+    }
+  } catch (_) {}
+  return null;
+}
+
+// Reconstruit un lien à partir des champs.
+String? buildLink(Map<String, String> f) {
+  final p = f['proto'] ?? '';
+  final remark = f['remark'] ?? '';
+  final port = int.tryParse(f['port'] ?? '') ?? 443;
+  if ((f['add'] ?? '').isEmpty) return null;
+  if (p == 'vmess') {
+    final j = {
+      'v': '2',
+      'ps': remark,
+      'add': f['add'],
+      'port': port,
+      'id': f['id'] ?? '',
+      'aid': int.tryParse(f['aid'] ?? '0') ?? 0,
+      'scn': (f['scn'] ?? '').isEmpty ? 'auto' : f['scn'],
+      'net': f['net'] ?? 'tcp',
+      'type': f['type'] ?? 'none',
+      'host': f['host'] ?? '',
+      'path': f['path'] ?? '',
+      'tls': f['tls'] ?? '',
+      'sni': f['sni'] ?? '',
+      'alpn': f['alpn'] ?? '',
+      'fp': f['fp'] ?? '',
+    };
+    return 'vmess://${base64Encode(utf8.encode(jsonEncode(j)))}';
+  }
+  if (p == 'vless' || p == 'trojan') {
+    final q = <String, String>{};
+    void put(String k, String? v) {
+      if (v != null && v.isNotEmpty) q[k] = v;
+    }
+
+    put('type', f['net']);
+    put('security', f['tls']);
+    if (p == 'vless') put('encryption', (f['enc'] ?? '').isEmpty ? 'none' : f['enc']);
+    put('flow', f['flow']);
+    put('host', f['host']);
+    put('path', f['path']);
+    put('sni', f['sni']);
+    put('alpn', f['alpn']);
+    put('fp', f['fp']);
+    put('serviceName', f['svc']);
+    f.forEach((k, v) {
+      if (k.startsWith('x_') && v.isNotEmpty) q[k.substring(2)] = v;
+    });
+    final id = f['id'] ?? '';
+    return Uri(
+      scheme: p,
+      userInfo: id.isEmpty ? null : id,
+      host: f['add'],
+      port: port,
+      queryParameters: q.isEmpty ? null : q,
+      fragment: remark.isEmpty ? null : remark,
+    ).toString();
+  }
+  if (p == 'ss') {
+    final cred = base64Encode(utf8.encode('${f['method'] ?? 'aes-256-gcm'}:${f['id'] ?? ''}'));
+    final raw = f['x_raw'] ?? '';
+    final extra = raw.isEmpty ? '' : '?$raw';
+    final frag = remark.isEmpty ? '' : '#${Uri.encodeComponent(remark)}';
+    return 'ss://$cred@${f['add']}:$port$extra$frag';
+  }
+  return null;
+}
+
+// ---------- Éditeur de config (champs détaillés) ----------
+class ConfigEditor extends StatefulWidget {
+  final Cfg? cfg;
+  const ConfigEditor({super.key, this.cfg});
+  @override
+  State<ConfigEditor> createState() => _ConfigEditorState();
+}
+
+class _ConfigEditorState extends State<ConfigEditor> {
+  late String proto;
+  String net = 'ws', tls = 'tls', vtype = 'none';
+  final Map<String, TextEditingController> c = {};
+  final Map<String, String> extra = {};
+  bool isNew = true;
+
+  static const keys = [
+    'remark', 'add', 'port', 'id', 'aid', 'scn', 'host', 'path', 'sni', 'alpn', 'fp',
+    'flow', 'enc', 'svc', 'method', 'expiry', 'limit'
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    for (final k in keys) {
+      c[k] = TextEditingController();
+    }
+    final cf = widget.cfg;
+    final f = cf == null ? null : parseLink(cf.link);
+    if (f != null && cf != null) {
+      isNew = false;
+      proto = f['proto'] ?? 'vmess';
+      f.forEach((k, v) {
+        if (c.containsKey(k)) c[k]!.text = v;
+        if (k.startsWith('x_')) extra[k] = v;
+      });
+      net = f['net'] ?? 'tcp';
+      tls = f['tls'] ?? '';
+      vtype = f['type'] ?? 'none';
+      c['expiry']!.text = cf.expiry;
+      c['limit']!.text = cf.limitMb > 0 ? '${cf.limitMb}' : '';
+    } else {
+      proto = 'vmess';
+      _defaults();
+    }
+  }
+
+  void _defaults() {
+    c['port']!.text = '443';
+    c['aid']!.text = '0';
+    c['scn']!.text = 'auto';
+    c['enc']!.text = 'none';
+    c['method']!.text = 'aes-256-gcm';
+    net = 'ws';
+    tls = 'tls';
+  }
+
+  void _err(String m) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  void _save() {
+    final f = <String, String>{'proto': proto, 'net': net, 'tls': tls, 'type': vtype};
+    for (final k in keys) {
+      f[k] = c[k]!.text.trim();
+    }
+    f.addAll(extra);
+    final link = buildLink(f);
+    if (link == null) return _err('Le serveur cible est obligatoire');
+    try {
+      FlutterV2ray.parseFromURL(link);
+    } catch (_) {
+      return _err('Config invalide : vérifie les champs');
+    }
+    final ex = c['expiry']!.text.trim();
+    if (ex.isNotEmpty && DateTime.tryParse(ex) == null) {
+      return _err('Date invalide (ex : 2026-12-31)');
+    }
+    final old = widget.cfg;
+    final name = f['remark']!.isEmpty ? f['add']! : f['remark']!;
+    Navigator.pop(
+      context,
+      Cfg(name, link, false,
+          expiry: ex,
+          limitMb: int.tryParse(c['limit']!.text.trim()) ?? 0,
+          used: old?.used ?? 0,
+          sub: old?.sub ?? ''),
+    );
+  }
+
+  Widget field(String k, String label, {TextInputType? type}) => Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: TextField(
+          controller: c[k],
+          keyboardType: type,
+          decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
+        ),
+      );
+
+  Widget drop(String label, String value, List<String> opts, void Function(String) on,
+      {Map<String, String>? names}) {
+    final list = opts.contains(value) ? opts : [...opts, value];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: InputDecorator(
+        decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
+        child: DropdownButtonHideUnderline(
+          child: DropdownButton<String>(
+            isDense: true,
+            isExpanded: true,
+            value: value,
+            items: list
+                .map((o) => DropdownMenuItem(
+                    value: o, child: Text(names?[o] ?? (o.isEmpty ? 'Aucune' : o))))
+                .toList(),
+            onChanged: (v) {
+              if (v != null) on(v);
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(
+          title: Text(isNew ? 'Nouvelle config' : 'Modifier la config'),
+          actions: [TextButton(onPressed: _save, child: const Text('Enregistrer'))],
+        ),
+        body: ListView(padding: const EdgeInsets.all(16), children: [
+          if (isNew)
+            drop('Protocole', proto, ['vmess', 'vless', 'trojan', 'ss'],
+                (v) => setState(() {
+                      proto = v;
+                      _defaults();
+                    }),
+                names: {'vmess': 'VMess', 'vless': 'VLESS', 'trojan': 'Trojan', 'ss': 'Shadowsocks'}),
+          field('remark', 'Nom'),
+          field('add', 'Serveur cible (target)'),
+          field('port', 'Port', type: TextInputType.number),
+          if (proto == 'vmess') ...[
+            field('id', 'UUID'),
+            field('aid', 'AlterId', type: TextInputType.number),
+            field('scn', 'Chiffrement (auto, aes-128-gcm...)'),
+          ],
+          if (proto == 'vless') ...[
+            field('id', 'UUID'),
+            field('enc', 'Encryption (none)'),
+            field('flow', 'Flow (facultatif)'),
+          ],
+          if (proto == 'trojan') field('id', 'Mot de passe'),
+          if (proto == 'ss') ...[
+            field('method', 'Méthode (ex : aes-256-gcm)'),
+            field('id', 'Mot de passe'),
+          ],
+          if (proto != 'ss') ...[
+            drop('Réseau', net, ['tcp', 'ws', 'grpc', 'h2', 'httpupgrade'],
+                (v) => setState(() => net = v)),
+            drop('Sécurité', tls, proto == 'vmess' ? ['', 'tls'] : ['none', 'tls', 'reality'],
+                (v) => setState(() => tls = v),
+                names: {'': 'Aucune', 'none': 'Aucune', 'tls': 'TLS', 'reality': 'Reality'}),
+            field('host', 'Host (header host)'),
+            field('path', 'Path'),
+            field('sni', 'SNI (server name indication)'),
+            field('alpn', 'ALPN (ex : h2,http/1.1)'),
+            field('fp', 'Fingerprint (ex : chrome)'),
+            if (proto == 'vless') field('svc', 'Nom du service (gRPC)'),
+          ],
+          const Divider(),
+          field('expiry', 'Expire le (AAAA-MM-JJ, facultatif)'),
+          field('limit', 'Limite de données en Mo (0 = aucune)', type: TextInputType.number),
+          const SizedBox(height: 8),
+          FilledButton(
+            onPressed: _save,
+            style: FilledButton.styleFrom(backgroundColor: kRed),
+            child: const Text('Enregistrer'),
+          ),
+        ]),
+      );
+}
+
 // ---------- Chiffrement des fichiers .otaku ----------
 cr.Pbkdf2 _kdf() =>
     cr.Pbkdf2(macAlgorithm: cr.Hmac.sha256(), iterations: 50000, bits: 256);
@@ -230,6 +589,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   bool autoConnect = false, mangekyoColor = true;
   String dns = 'auto';
   String excluded = '';
+  int skin = 0;
+  bool hotspot = false;
 
   bool get connected => state == 'CONNECTED';
   bool get busy => state == 'CONNECTING' || searching;
@@ -269,6 +630,10 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       if (prev != state) _onState(state);
     });
     v2ray.initializeV2Ray();
+    kChan.setMethodCallHandler((call) async {
+      if (call.method == 'onIntent') _incoming('${call.arguments}');
+      return null;
+    });
     _load();
   }
 
@@ -356,7 +721,13 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       autoConnect = p.getBool('autoConnect') ?? false;
       mangekyoColor = p.getBool('mangekyoColor') ?? true;
       excluded = p.getString('excluded') ?? '';
+      skin = p.getInt('skin') ?? 0;
+      hotspot = p.getBool('hotspot') ?? false;
     });
+    try {
+      final t = await kChan.invokeMethod<String>('getInitial');
+      if (t != null && t.isNotEmpty) await _incoming(t);
+    } catch (_) {}
     if (subs.isNotEmpty) await updateSubs(quiet: true);
     if (autoConnect && configs.isNotEmpty && mounted) {
       wantOn = true;
@@ -394,6 +765,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     await p.setBool('autoConnect', autoConnect);
     await p.setBool('mangekyoColor', mangekyoColor);
     await p.setString('excluded', excluded);
+    await p.setInt('skin', skin);
+    await p.setBool('hotspot', hotspot);
   }
 
   void snack(String m) {
@@ -436,6 +809,16 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                 ? ['8.8.8.8', '8.8.4.4']
                 : ['94.140.14.14', '94.140.15.15'];
         m['dns'] = {'servers': servers};
+      }
+      if (hotspot) {
+        final ins = m['inbounds'];
+        if (ins is List) {
+          for (final i in ins) {
+            if (i is Map && (i['protocol'] == 'http' || i['protocol'] == 'socks')) {
+              i['listen'] = '0.0.0.0';
+            }
+          }
+        }
       }
       return jsonEncode(m);
     } catch (_) {
@@ -869,6 +1252,178 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     );
   }
 
+  Future<void> newConfig() async {
+    final r = await Navigator.push<Cfg>(
+        context, MaterialPageRoute(builder: (_) => const ConfigEditor()));
+    if (r != null) {
+      setState(() => configs.add(r));
+      _save();
+      snack('Config créée');
+    }
+  }
+
+  Future<void> _incoming(String t) async {
+    final l = await parseImport(t, false);
+    if (l.isEmpty) {
+      snack('Fichier non reconnu');
+      return;
+    }
+    setState(() => tab = 1);
+    _addImported(l);
+  }
+
+  Future<void> pickApps() async {
+    var apps = <Map<String, String>>[];
+    try {
+      final r = await kChan.invokeMethod<List<dynamic>>('listApps');
+      apps = (r ?? []).map((e) => Map<String, String>.from(e as Map)).toList();
+    } catch (_) {}
+    if (apps.isEmpty) return excludeDialog();
+    final chosen = excludedApps.toSet();
+    final q = TextEditingController();
+    var filter = '';
+    if (!mounted) return;
+    await showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(builder: (ctx, setD) {
+        final shown = apps
+            .where((a) =>
+                filter.isEmpty ||
+                a['name']!.toLowerCase().contains(filter) ||
+                a['pkg']!.contains(filter))
+            .toList();
+        return AlertDialog(
+          title: const Text('Applis hors VPN'),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 420,
+            child: Column(children: [
+              TextField(
+                controller: q,
+                decoration: const InputDecoration(hintText: 'Rechercher'),
+                onChanged: (v) => setD(() => filter = v.trim().toLowerCase()),
+              ),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: shown.length,
+                  itemBuilder: (_, i) {
+                    final a = shown[i];
+                    return CheckboxListTile(
+                      dense: true,
+                      title: Text(a['name']!),
+                      subtitle: Text(a['pkg']!, style: const TextStyle(fontSize: 11)),
+                      value: chosen.contains(a['pkg']),
+                      onChanged: (v) => setD(() {
+                        if (v == true) {
+                          chosen.add(a['pkg']!);
+                        } else {
+                          chosen.remove(a['pkg']!);
+                        }
+                      }),
+                    );
+                  },
+                ),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
+            FilledButton(
+              onPressed: () {
+                setState(() => excluded = chosen.join(','));
+                _saveSettings();
+                Navigator.pop(ctx);
+              },
+              style: FilledButton.styleFrom(backgroundColor: kRed),
+              child: const Text('Enregistrer'),
+            ),
+          ],
+        );
+      }),
+    );
+  }
+
+  void skinDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Skin du Mangekyō'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: GridView.count(
+            crossAxisCount: 4,
+            shrinkWrap: true,
+            mainAxisSpacing: 8,
+            crossAxisSpacing: 8,
+            children: [
+              for (var s = 0; s <= 14; s++)
+                GestureDetector(
+                  onTap: () {
+                    setState(() => skin = s);
+                    _saveSettings();
+                    Navigator.pop(ctx);
+                  },
+                  child: Container(
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                          color: skin == s ? kRed : Colors.transparent, width: 3),
+                    ),
+                    child: ClipOval(child: Image.asset(skinAsset(s))),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer'))
+        ],
+      ),
+    );
+  }
+
+  Future<void> hotspotInfo() async {
+    final cfg = configs.isEmpty ? null : parse(configs[sel].link);
+    final ports = <String>[];
+    if (cfg != null) {
+      try {
+        final m = jsonDecode(buildConfig(cfg)) as Map<String, dynamic>;
+        for (final i in (m['inbounds'] as List)) {
+          if (i is Map && (i['protocol'] == 'http' || i['protocol'] == 'socks')) {
+            ports.add('${i['protocol']} : ${i['port']}');
+          }
+        }
+      } catch (_) {}
+    }
+    final ips = <String>[];
+    try {
+      for (final ni in await NetworkInterface.list(type: InternetAddressType.IPv4)) {
+        for (final a in ni.addresses) {
+          ips.add('${ni.name} : ${a.address}');
+        }
+      }
+    } catch (_) {}
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Partage par hotspot'),
+        content: SingleChildScrollView(
+          child: Text(
+              '1. Active le hotspot du téléphone et connecte l\'autre appareil.\n'
+              '2. Sur l\'autre appareil, règle un proxy manuel avec l\'adresse du hotspot et un port ci-dessous.\n\n'
+              'Ports :\n${ports.isEmpty ? 'inconnus (sélectionne une config valide)' : ports.join('\n')}\n\n'
+              'Adresses du téléphone :\n${ips.isEmpty ? 'aucune' : ips.join('\n')}\n\n'
+              'Attention : toute personne connectée à ton hotspot pourra utiliser ce proxy. '
+              'Les applis qui ignorent le proxy ne passeront pas par le VPN.'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer'))
+        ],
+      ),
+    );
+  }
+
   Future<void> _menu(String v, int i) async {
     final c = configs[i];
     if (v == 'test') {
@@ -877,7 +1432,19 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       if (!mounted) return;
       setState(() => pings[i] = d);
     } else if (v == 'edit') {
-      await editDialog(i);
+      if (parseLink(c.link) == null) {
+        await editDialog(i);
+      } else {
+        final r = await Navigator.push<Cfg>(
+            context, MaterialPageRoute(builder: (_) => ConfigEditor(cfg: c)));
+        if (r != null) {
+          setState(() {
+            configs[i] = r;
+            pings.clear();
+          });
+          _save();
+        }
+      }
     } else if (v == 'resetuse') {
       setState(() => c.used = 0);
       _save();
@@ -968,6 +1535,16 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
               'Active « VPN permanent » puis « Bloquer les connexions sans VPN ».\n\n'
               'Les noms des menus varient selon les téléphones.'),
           actions: [
+            TextButton(
+                onPressed: () async {
+                  Navigator.pop(ctx);
+                  try {
+                    await kChan.invokeMethod('openVpnSettings');
+                  } catch (_) {
+                    snack('Ouverture impossible, fais-le à la main');
+                  }
+                },
+                child: const Text('Ouvrir les réglages VPN')),
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Compris'))
           ],
         ),
@@ -1076,7 +1653,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final deg = mangekyoColor ? [0.0, 260.0, 200.0, 120.0, 40.0, 310.0][sel % 6] : 0.0;
     final glow = connected ? HSLColor.fromAHSL(1, deg, 0.85, 0.5).toColor() : kRed;
     Widget img = Image.asset(
-        connected ? 'assets/images/mangekyo.png' : 'assets/images/sharingan.png');
+        connected ? skinAsset(skin) : 'assets/images/sharingan.png');
     if (connected && deg != 0) {
       img = ColorFiltered(colorFilter: ColorFilter.matrix(hueMatrix(deg)), child: img);
     }
@@ -1224,7 +1801,15 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                   shareFile(configs, 'otaku_configs');
                 },
                 icon: const Icon(Icons.share)),
-            IconButton.filledTonal(onPressed: importDialog, icon: const Icon(Icons.add)),
+            PopupMenuButton<String>(
+              icon: const CircleAvatar(
+                  backgroundColor: kRed, child: Icon(Icons.add, color: Colors.white)),
+              onSelected: (v) => v == 'new' ? newConfig() : importDialog(),
+              itemBuilder: (_) => const [
+                PopupMenuItem(value: 'import', child: Text('Importer (lien, code, fichier)')),
+                PopupMenuItem(value: 'new', child: Text('Créer manuellement')),
+              ],
+            ),
           ]),
         ),
         Expanded(
@@ -1336,13 +1921,21 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         sec('Mode et applis'),
         sw('Proxy seulement', 'Sans VPN système (pour apps compatibles)', proxyOnly,
             (v) => proxyOnly = v),
+        sw('Partager le VPN par hotspot', 'Ouvre le proxy aux appareils de ton hotspot', hotspot,
+            (v) => hotspot = v),
+        if (hotspot)
+          ListTile(
+            leading: const Icon(Icons.wifi_tethering),
+            title: const Text('Infos de partage (adresse et ports)'),
+            onTap: hotspotInfo,
+          ),
         ListTile(
           leading: const Icon(Icons.apps),
           title: const Text('Applis hors VPN'),
           subtitle: Text(excludedApps.isEmpty
               ? 'Aucune'
               : '${excludedApps.length} appli(s) en accès direct'),
-          onTap: excludeDialog,
+          onTap: pickApps,
         ),
         sec('Sécurité'),
         ListTile(
@@ -1354,6 +1947,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         sec('Apparence'),
         sw('Mangekyō selon le serveur', 'Une couleur différente par config', mangekyoColor,
             (v) => mangekyoColor = v),
+        ListTile(
+          leading: const Icon(Icons.remove_red_eye),
+          title: const Text('Skin du Mangekyō'),
+          subtitle: Text(skin == 0 ? 'Classique' : 'Skin $skin'),
+          onTap: skinDialog,
+        ),
         sec('Abonnements'),
         ListTile(
           leading: const Icon(Icons.add_link),
@@ -1427,7 +2026,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v3.0'),
+          title: Text('OTAKU TUNNEL v4.0'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
