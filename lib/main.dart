@@ -72,6 +72,15 @@ class Cfg {
   }
 
   bool get overLimit => limitMb > 0 && used >= limitMb * 1048576;
+  bool get isJson => link.startsWith('xrayjson://');
+}
+
+// Résultat de lecture d'une config (lien classique ou JSON complet du moteur).
+class Parsed {
+  final String remark;
+  final String address;
+  final String Function() full;
+  Parsed(this.remark, this.address, this.full);
 }
 
 String fmtSpeed(num b) {
@@ -152,7 +161,7 @@ Map<String, String>? parseLink(String link) {
       final q = u.queryParameters;
       const known = {
         'type', 'security', 'host', 'path', 'sni', 'alpn', 'fp', 'flow', 'encryption',
-        'serviceName', 'allowInsecure'
+        'serviceName', 'allowInsecure', 'headerType'
       };
       final f = <String, String>{
         'proto': u.scheme,
@@ -171,6 +180,7 @@ Map<String, String>? parseLink(String link) {
         'enc': q['encryption'] ?? 'none',
         'svc': q['serviceName'] ?? '',
         'ins': q['allowInsecure'] ?? '',
+        'type': q['headerType'] ?? 'none',
       };
       q.forEach((k, v) {
         if (!known.contains(k)) f['x_$k'] = v;
@@ -264,6 +274,8 @@ String? buildLink(Map<String, String> f) {
     put('alpn', f['alpn']);
     put('fp', f['fp']);
     put('serviceName', f['svc']);
+    final ht = f['type'] ?? 'none';
+    if (ht.isNotEmpty && ht != 'none') q['headerType'] = ht;
     if ((f['ins'] ?? '') == '1') q['allowInsecure'] = '1';
     f.forEach((k, v) {
       if (k.startsWith('x_') && v.isNotEmpty) q[k.substring(2)] = v;
@@ -446,8 +458,11 @@ class _ConfigEditorState extends State<ConfigEditor> {
             field('id', 'Mot de passe'),
           ],
           if (proto != 'ss') ...[
-            drop('Réseau', net, ['tcp', 'ws', 'grpc', 'h2', 'httpupgrade'],
+            drop('Réseau', net, ['tcp', 'ws', 'grpc', 'h2', 'httpupgrade', 'kcp', 'quic'],
                 (v) => setState(() => net = v)),
+            drop('En-tête (head type)', vtype,
+                ['none', 'http', 'srtp', 'utp', 'wechat-video', 'dtls', 'wireguard'],
+                (v) => setState(() => vtype = v)),
             drop('Sécurité', tls, proto == 'vmess' ? ['', 'tls'] : ['none', 'tls', 'reality'],
                 (v) => setState(() => tls = v),
                 names: {'': 'Aucune', 'none': 'Aucune', 'tls': 'TLS', 'reality': 'Reality'}),
@@ -809,6 +824,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   // ----- Outils -----
   String proto(String link) {
     final l = link.toLowerCase();
+    if (l.startsWith('xrayjson')) return 'JSON';
     if (l.startsWith('vless')) return 'VLESS';
     if (l.startsWith('vmess')) return 'VMess';
     if (l.startsWith('trojan')) return 'Trojan';
@@ -816,9 +832,29 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     return '?';
   }
 
-  V2RayURL? parse(String link) {
+  Parsed? parse(String link) {
     try {
-      return FlutterV2ray.parseFromURL(link);
+      if (link.startsWith('xrayjson://')) {
+        final raw = utf8.decode(b64dec(link.substring(11)));
+        final j = jsonDecode(raw) as Map<String, dynamic>;
+        var addr = '';
+        final outs = j['outbounds'];
+        if (outs is List && outs.isNotEmpty && outs[0] is Map) {
+          final st = (outs[0] as Map)['settings'];
+          if (st is Map) {
+            final vn = st['vnext'];
+            final sv = st['servers'];
+            if (vn is List && vn.isNotEmpty && vn[0] is Map) {
+              addr = '${(vn[0] as Map)['address']}';
+            } else if (sv is List && sv.isNotEmpty && sv[0] is Map) {
+              addr = '${(sv[0] as Map)['address']}';
+            }
+          }
+        }
+        return Parsed('${j['remarks'] ?? j['remark'] ?? 'Config JSON'}', addr, () => raw);
+      }
+      final v = FlutterV2ray.parseFromURL(link);
+      return Parsed(v.remark, v.address, () => v.getFullConfiguration());
     } catch (_) {
       return null;
     }
@@ -826,8 +862,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 
   // Construit la config du moteur : types corrigés, serveur résolu avec le DNS du
   // téléphone, header host rempli, allowInsecure, Turbo, DNS et hotspot.
-  Future<String> buildConfig(V2RayURL p, String link) async {
-    final raw = p.getFullConfiguration();
+  Future<String> buildConfig(Parsed p, String link) async {
+    final raw = p.full();
+    if (link.startsWith('xrayjson://')) return raw;
     try {
       final m = jsonDecode(raw) as Map<String, dynamic>;
       final lf = parseLink(link) ?? <String, String>{};
@@ -1102,6 +1139,16 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   // ----- Import / export -----
   List<Cfg> _linesToCfgs(String text, bool hide) {
     final out = <Cfg>[];
+    final tt = text.trim();
+    if (tt.startsWith('{')) {
+      try {
+        final j = jsonDecode(tt);
+        if (j is Map && j['outbounds'] is List) {
+          final nm = '${j['remarks'] ?? j['remark'] ?? 'Config JSON'}';
+          return [Cfg(nm, 'xrayjson://${base64Encode(utf8.encode(jsonEncode(j)))}', hide)];
+        }
+      } catch (_) {}
+    }
     for (final l in text.split(RegExp(r'[\r\n]+'))) {
       final t = l.trim();
       if (t.contains('://')) {
@@ -1234,7 +1281,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   Future<void> importDialog() async {
     final c = TextEditingController();
     final clip = (await Clipboard.getData('text/plain'))?.text ?? '';
-    if (clip.contains('://') || clip.startsWith('OTAKU')) c.text = clip.trim();
+    if (clip.contains('://') || clip.startsWith('OTAKU') || clip.trim().startsWith('{')) {
+      c.text = clip.trim();
+    }
     var hide = false;
     if (!mounted) return;
     await showDialog(
@@ -1341,6 +1390,76 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     );
   }
 
+  Future<String> _coreReport(Cfg c) async {
+    final p = parse(c.link);
+    final b = StringBuffer('\n--- Test du moteur (proxy local) ---\n');
+    if (p == null) {
+      b.writeln('Config illisible.');
+      return b.toString();
+    }
+    final cfgJson = await buildConfig(p, c.link);
+    var port = 10809;
+    var hasHttp = false;
+    try {
+      final m = jsonDecode(cfgJson) as Map<String, dynamic>;
+      for (final i in (m['inbounds'] as List)) {
+        if (i is Map && i['protocol'] == 'http') {
+          port = toInt(i['port']);
+          hasHttp = true;
+        }
+      }
+    } catch (_) {}
+    if (!hasHttp) {
+      b.writeln('Pas de proxy HTTP local dans cette config : test impossible.');
+      return b.toString();
+    }
+    final wasOn = connected;
+    if (!wasOn) {
+      wantOn = false;
+      v2ray.startV2Ray(
+        remark: c.name,
+        config: cfgJson,
+        proxyOnly: true,
+        bypassSubnets: null,
+        blockedApps: null,
+      );
+      for (var k = 0; k < 20 && !connected; k++) {
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+      await Future.delayed(const Duration(seconds: 1));
+    }
+    if (!connected) {
+      b.writeln('Le moteur ne démarre pas : config refusée.');
+    } else {
+      var ok = false;
+      for (final url in [
+        'http://connectivitycheck.gstatic.com/generate_204',
+        'http://www.msftconnecttest.com/connecttest.txt'
+      ]) {
+        final cl = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+        cl.findProxy = (u) => 'PROXY 127.0.0.1:$port';
+        final sw = Stopwatch()..start();
+        try {
+          final req = await cl.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 10));
+          final res = await req.close().timeout(const Duration(seconds: 10));
+          await res.drain<void>();
+          b.writeln('$url -> ${res.statusCode} (${sw.elapsedMilliseconds} ms)');
+          if (res.statusCode == 204 || res.statusCode == 200) ok = true;
+        } catch (e) {
+          b.writeln('$url -> ECHEC ${e.runtimeType}');
+        } finally {
+          cl.close(force: true);
+        }
+      }
+      b.writeln(ok
+          ? '=> Le moteur et le serveur laissent passer le trafic.\n'
+              '   Si Android n\'envoie rien, le blocage vient du tunnel VPN du système.'
+          : '=> Le moteur ne passe pas par le serveur : Host, Path, port, SNI ou serveur à revoir.');
+    }
+    if (!wasOn) v2ray.stopV2Ray();
+    return b.toString();
+  }
+
   Future<String> _diagReport(Cfg c, int i) async {
     final f = parseLink(c.link);
     if (f == null) return 'Lien non lisible.';
@@ -1413,7 +1532,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ]),
       ),
     );
-    final report = await _diagReport(c, i);
+    final report = (await _diagReport(c, i)) + (await _coreReport(c));
     if (!mounted) return;
     Navigator.of(context).pop();
     showDialog(
@@ -1946,6 +2065,15 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             icon: const Icon(Icons.speed),
             label: Text(speedLabel()),
           ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: () {
+              if (configs.isEmpty) return snack('Ajoute d\'abord une config');
+              diagnose(configs[sel], sel);
+            },
+            icon: const Icon(Icons.troubleshoot),
+            label: const Text('Diagnostic complet'),
+          ),
           const SizedBox(height: 16),
           Container(
             width: double.infinity,
@@ -2071,7 +2199,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                             const PopupMenuItem(value: 'test', child: Text('Tester')),
                             if (!c.hidden)
                               const PopupMenuItem(value: 'diag', child: Text('Diagnostiquer')),
-                            if (!c.hidden)
+                            if (!c.hidden && !c.isJson)
                               const PopupMenuItem(value: 'edit', child: Text('Modifier')),
                             if (!c.hidden)
                               const PopupMenuItem(
@@ -2260,7 +2388,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v4.1'),
+          title: Text('OTAKU TUNNEL v4.2'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
