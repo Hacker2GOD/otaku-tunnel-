@@ -466,8 +466,8 @@ class _ConfigEditorState extends State<ConfigEditor> {
             drop('Sécurité', tls, proto == 'vmess' ? ['', 'tls'] : ['none', 'tls', 'reality'],
                 (v) => setState(() => tls = v),
                 names: {'': 'Aucune', 'none': 'Aucune', 'tls': 'TLS', 'reality': 'Reality'}),
-            field('host', 'Host (header host)'),
-            field('path', 'Path'),
+            field('host', 'Host (request host / ws host)'),
+            field('path', 'Path (ws path / h2 path)'),
             field('sni', 'SNI (server name indication)'),
             field('alpn', 'ALPN (ex : h2,http/1.1)'),
             field('fp', 'Fingerprint (ex : chrome)'),
@@ -626,7 +626,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   String excluded = '';
   int skin = 0;
   bool hotspot = false;
-  bool preResolve = true, autoHost = true;
+  bool preResolve = true, autoHost = true, dnsTunnel = true;
 
   bool get connected => state == 'CONNECTED';
   bool get busy => state == 'CONNECTING' || searching;
@@ -768,6 +768,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       hotspot = p.getBool('hotspot') ?? false;
       preResolve = p.getBool('preResolve') ?? true;
       autoHost = p.getBool('autoHost') ?? true;
+      dnsTunnel = p.getBool('dnsTunnel') ?? true;
     });
     try {
       final t = await kChan.invokeMethod<String>('getInitial');
@@ -814,6 +815,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     await p.setBool('hotspot', hotspot);
     await p.setBool('preResolve', preResolve);
     await p.setBool('autoHost', autoHost);
+    await p.setBool('dnsTunnel', dnsTunnel);
   }
 
   void snack(String m) {
@@ -926,13 +928,40 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         }
         if (turbo) o['mux'] = {'enabled': true, 'concurrency': 8};
       }
-      if (dns != 'auto') {
-        final servers = dns == 'cloudflare'
-            ? ['1.1.1.1', '1.0.0.1']
-            : dns == 'google'
-                ? ['8.8.8.8', '8.8.4.4']
-                : ['94.140.14.14', '94.140.15.15'];
-        m['dns'] = {'servers': servers};
+      final dnsBase = dns == 'google'
+          ? ['8.8.8.8', '8.8.4.4']
+          : dns == 'adguard'
+              ? ['94.140.14.14', '94.140.15.15']
+              : ['1.1.1.1', '1.0.0.1'];
+      if (dnsTunnel) {
+        // Les requêtes DNS venant d'Android (port 53) sont prises en charge par le moteur,
+        // qui les envoie en TCP à travers le serveur.
+        m['dns'] = {'servers': dnsBase.map((e) => 'tcp://$e').toList()};
+        final outsL = m['outbounds'];
+        if (outsL is List && !outsL.any((o) => o is Map && o['tag'] == 'dns-out')) {
+          outsL.add({'protocol': 'dns', 'tag': 'dns-out'});
+        }
+        final tags = <String>[];
+        final insL = m['inbounds'];
+        if (insL is List) {
+          for (final i in insL) {
+            if (i is Map && i['protocol'] == 'socks' && i['tag'] != null) tags.add('${i['tag']}');
+          }
+        }
+        final rt = m['routing'] is Map ? m['routing'] as Map : <String, dynamic>{};
+        final rules = rt['rules'] is List ? rt['rules'] as List : <dynamic>[];
+        if (!rules.any((r) => r is Map && r['outboundTag'] == 'dns-out')) {
+          rules.insert(0, {
+            'type': 'field',
+            'inboundTag': tags.isEmpty ? ['socks'] : tags,
+            'port': '53',
+            'outboundTag': 'dns-out',
+          });
+        }
+        rt['rules'] = rules;
+        m['routing'] = rt;
+      } else if (dns != 'auto') {
+        m['dns'] = {'servers': dnsBase};
       }
       if (hotspot) {
         final ins = m['inbounds'];
@@ -1390,6 +1419,44 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     );
   }
 
+  Future<String> _tunnelReport() async {
+    final b = StringBuffer('\n--- Test du tunnel Android ---\n');
+    if (!connected) {
+      b.writeln('Connecte-toi d\'abord pour tester le tunnel.');
+      return b.toString();
+    }
+    var tcpOk = false;
+    for (final ip in ['1.1.1.1', '8.8.8.8']) {
+      final sw = Stopwatch()..start();
+      try {
+        final so = await Socket.connect(ip, 443, timeout: const Duration(seconds: 6));
+        so.destroy();
+        b.writeln('TCP $ip:443 (sans DNS) : OK (${sw.elapsedMilliseconds} ms)');
+        tcpOk = true;
+      } catch (e) {
+        b.writeln('TCP $ip:443 (sans DNS) : ECHEC');
+      }
+    }
+    var dnsOk = false;
+    final sw2 = Stopwatch()..start();
+    try {
+      final r = await InternetAddress.lookup('example.com').timeout(const Duration(seconds: 8));
+      dnsOk = r.isNotEmpty;
+      b.writeln('DNS example.com : OK -> ${r.first.address} (${sw2.elapsedMilliseconds} ms)');
+    } catch (e) {
+      b.writeln('DNS example.com : ECHEC');
+    }
+    if (tcpOk && !dnsOk) {
+      b.writeln('=> Le tunnel passe, mais pas le DNS. Active « DNS via le tunnel » dans Réglages.');
+    } else if (!tcpOk && !dnsOk) {
+      b.writeln('=> Rien ne passe dans le tunnel Android. Le moteur marche : '
+          'le blocage vient du VPN du système (essaie sur un téléphone).');
+    } else {
+      b.writeln('=> Le tunnel Android laisse passer le trafic.');
+    }
+    return b.toString();
+  }
+
   Future<String> _coreReport(Cfg c) async {
     final p = parse(c.link);
     final b = StringBuffer('\n--- Test du moteur (proxy local) ---\n');
@@ -1532,7 +1599,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ]),
       ),
     );
-    final report = (await _diagReport(c, i)) + (await _coreReport(c));
+    final report = (await _diagReport(c, i)) + (await _coreReport(c)) + (await _tunnelReport());
     if (!mounted) return;
     Navigator.of(context).pop();
     showDialog(
@@ -2276,6 +2343,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             },
           ),
         ),
+        sw('DNS via le tunnel', 'Les noms de sites sont résolus par le serveur (corrige « connecté mais rien ne passe »)',
+            dnsTunnel, (v) => dnsTunnel = v),
         sw('Résoudre le serveur avant connexion',
             'Corrige les cas « connecté mais rien ne passe »', preResolve, (v) => preResolve = v),
         sw('Host automatique', 'Remplit un header host vide avec l\'adresse du serveur', autoHost,
@@ -2388,7 +2457,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v4.2'),
+          title: Text('OTAKU TUNNEL v4.3'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
