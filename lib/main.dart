@@ -75,6 +75,14 @@ class Cfg {
   bool get isJson => link.startsWith('xrayjson://');
 }
 
+class SpeedRes {
+  final double mbps;
+  final int bytes;
+  final int ttfb;
+  final String error;
+  SpeedRes(this.mbps, this.bytes, this.ttfb, this.error);
+}
+
 // Résultat de lecture d'une config (lien classique ou JSON complet du moteur).
 class Parsed {
   final String remark;
@@ -626,6 +634,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   String duration = '00:00:00';
   bool wantOn = false, searching = false, testing = false;
   double? speedMbps;
+  String speedInfo = '';
   int retries = 0;
   bool turbo = false, autoReco = true, autoBest = false, proxyOnly = false;
   bool autoConnect = false, mangekyoColor = true;
@@ -654,7 +663,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         upSpeed = toInt(s.uploadSpeed);
         dlTotal = toInt(s.download);
         upTotal = toInt(s.upload);
-        duration = '${s.duration}';
+        duration = s.duration;
         if (connected) {
           hist.add(dlSpeed.toDouble());
           if (hist.length > 40) hist.removeAt(0);
@@ -1041,35 +1050,65 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     setState(() => pings[sel] = d);
   }
 
+  Future<SpeedRes> _download(String url) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 7);
+    try {
+      final sw = Stopwatch()..start();
+      final req = await client.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 7));
+      final res = await req.close().timeout(const Duration(seconds: 7));
+      if (res.statusCode != 200) return SpeedRes(-1, 0, 0, 'HTTP ${res.statusCode}');
+      final ttfb = sw.elapsedMilliseconds;
+      final dl = Stopwatch()..start();
+      var n = 0;
+      try {
+        await for (final chunk in res.timeout(const Duration(seconds: 6))) {
+          n += chunk.length;
+          if (dl.elapsed.inSeconds >= 8) break;
+        }
+      } catch (_) {}
+      final secs = max(dl.elapsedMilliseconds / 1000, 0.001);
+      if (n < 30000) return SpeedRes(-1, n, ttfb, 'trop peu de données reçues');
+      return SpeedRes(n * 8 / 1000000 / secs, n, ttfb, '');
+    } catch (e) {
+      return SpeedRes(-1, 0, 0, e.runtimeType.toString());
+    } finally {
+      client.close(force: true);
+    }
+  }
+
   Future<void> speedTest() async {
     if (testing) return;
     setState(() {
       testing = true;
       speedMbps = null;
+      speedInfo = '';
     });
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
-    double res = -1;
-    try {
-      final sw = Stopwatch()..start();
-      final req = await client
-          .getUrl(Uri.parse('https://speed.cloudflare.com/__down?bytes=10000000'));
-      final r = await req.close();
-      var n = 0;
-      await for (final chunk in r) {
-        n += chunk.length;
-        if (sw.elapsed.inSeconds >= 10) break;
+    const urls = [
+      'https://speed.cloudflare.com/__down?bytes=25000000',
+      'https://proof.ovh.net/files/10Mb.dat',
+      'http://speedtest.tele2.net/10MB.zip',
+      'https://cachefly.cachefly.net/10mb.test',
+    ];
+    var res = SpeedRes(-1, 0, 0, '');
+    var host = '';
+    final errs = <String>[];
+    for (final u in urls) {
+      final r = await _download(u);
+      if (r.mbps > 0) {
+        res = r;
+        host = Uri.parse(u).host;
+        break;
       }
-      final secs = max(sw.elapsedMilliseconds / 1000, 0.001);
-      res = n * 8 / 1000000 / secs;
-    } catch (_) {
-      res = -1;
-    } finally {
-      client.close(force: true);
+      errs.add('${Uri.parse(u).host} : ${r.error}');
     }
     if (!mounted) return;
     setState(() {
       testing = false;
-      speedMbps = res;
+      speedMbps = res.mbps;
+      speedInfo = res.mbps > 0
+          ? '$host • ${fmtBytes(res.bytes)} reçus • latence ${res.ttfb} ms • '
+              '${(res.mbps / 8).toStringAsFixed(2)} Mo/s${connected ? ' • via VPN' : ' • connexion directe'}'
+          : errs.join('\n');
     });
   }
 
@@ -2095,7 +2134,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     if (testing) return 'Test en cours...';
     final s = speedMbps;
     if (s == null) return 'Test de vitesse';
-    return s < 0 ? 'Test impossible' : '${s.toStringAsFixed(1)} Mb/s';
+    return s < 0 ? 'Échec, réessayer' : '${s.toStringAsFixed(1)} Mb/s';
   }
 
   Widget eye() {
@@ -2110,7 +2149,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       width: 190,
       height: 190,
       decoration: BoxDecoration(shape: BoxShape.circle, boxShadow: [
-        BoxShadow(color: glow.withOpacity(connected ? 0.8 : 0.3), blurRadius: 40),
+        BoxShadow(color: glow.withValues(alpha: connected ? 0.8 : 0.3), blurRadius: 40),
       ]),
       child: img,
     );
@@ -2170,6 +2209,13 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             icon: const Icon(Icons.speed),
             label: Text(speedLabel()),
           ),
+          if (speedInfo.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(speedInfo,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white54, fontSize: 11)),
+            ),
           const SizedBox(height: 8),
           OutlinedButton.icon(
             onPressed: () {
@@ -2501,7 +2547,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v5.0'),
+          title: Text('OTAKU TUNNEL v5.1'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
