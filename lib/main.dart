@@ -255,7 +255,7 @@ String? buildLink(Map<String, String> f) {
       'alpn': f['alpn'] ?? '',
       'fp': f['fp'] ?? '',
     };
-    if ((f['ins'] ?? '') == '1') j['allowInsecure'] = '1';
+    if ((f['ins'] ?? '').isNotEmpty) j['allowInsecure'] = f['ins'];
     return 'vmess://${base64Encode(utf8.encode(jsonEncode(j)))}';
   }
   if (p == 'vless' || p == 'trojan') {
@@ -276,7 +276,7 @@ String? buildLink(Map<String, String> f) {
     put('serviceName', f['svc']);
     final ht = f['type'] ?? 'none';
     if (ht.isNotEmpty && ht != 'none') q['headerType'] = ht;
-    if ((f['ins'] ?? '') == '1') q['allowInsecure'] = '1';
+    if ((f['ins'] ?? '').isNotEmpty) q['allowInsecure'] = f['ins']!;
     f.forEach((k, v) {
       if (k.startsWith('x_') && v.isNotEmpty) q[k.substring(2)] = v;
     });
@@ -303,7 +303,8 @@ String? buildLink(Map<String, String> f) {
 // ---------- Éditeur de config (champs détaillés) ----------
 class ConfigEditor extends StatefulWidget {
   final Cfg? cfg;
-  const ConfigEditor({super.key, this.cfg});
+  final bool defaultInsecure;
+  const ConfigEditor({super.key, this.cfg, this.defaultInsecure = false});
   @override
   State<ConfigEditor> createState() => _ConfigEditorState();
 }
@@ -339,7 +340,8 @@ class _ConfigEditorState extends State<ConfigEditor> {
       net = f['net'] ?? 'tcp';
       tls = f['tls'] ?? '';
       vtype = f['type'] ?? 'none';
-      insecure = f['ins'] == '1' || f['ins'] == 'true';
+      final ir = f['ins'] ?? '';
+      insecure = ir.isEmpty ? widget.defaultInsecure : (ir == '1' || ir.toLowerCase() == 'true');
       c['expiry']!.text = cf.expiry;
       c['limit']!.text = cf.limitMb > 0 ? '${cf.limitMb}' : '';
     } else {
@@ -356,6 +358,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
     c['method']!.text = 'aes-256-gcm';
     net = 'ws';
     tls = 'tls';
+    insecure = widget.defaultInsecure;
   }
 
   void _err(String m) =>
@@ -367,7 +370,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
       f[k] = c[k]!.text.trim();
     }
     f.addAll(extra);
-    f['ins'] = insecure ? '1' : '';
+    f['ins'] = insecure ? '1' : '0';
     final link = buildLink(f);
     if (link == null) return _err('Le serveur cible est obligatoire');
     try {
@@ -445,7 +448,11 @@ class _ConfigEditorState extends State<ConfigEditor> {
           if (proto == 'vmess') ...[
             field('id', 'UUID'),
             field('aid', 'AlterId', type: TextInputType.number),
-            field('scn', 'Chiffrement (auto, aes-128-gcm...)'),
+            drop(
+                'Chiffrement (security)',
+                c['scn']!.text.isEmpty ? 'auto' : c['scn']!.text,
+                ['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none', 'zero'],
+                (v) => setState(() => c['scn']!.text = v)),
           ],
           if (proto == 'vless') ...[
             field('id', 'UUID'),
@@ -466,8 +473,8 @@ class _ConfigEditorState extends State<ConfigEditor> {
             drop('Sécurité', tls, proto == 'vmess' ? ['', 'tls'] : ['none', 'tls', 'reality'],
                 (v) => setState(() => tls = v),
                 names: {'': 'Aucune', 'none': 'Aucune', 'tls': 'TLS', 'reality': 'Reality'}),
-            field('host', 'Host (request host / ws host)'),
-            field('path', 'Path (ws path / h2 path)'),
+            field('host', 'Host (header host)'),
+            field('path', 'Path'),
             field('sni', 'SNI (server name indication)'),
             field('alpn', 'ALPN (ex : h2,http/1.1)'),
             field('fp', 'Fingerprint (ex : chrome)'),
@@ -626,7 +633,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   String excluded = '';
   int skin = 0;
   bool hotspot = false;
-  bool preResolve = true, autoHost = true, dnsTunnel = true;
+  bool preResolve = true, autoHost = true;
+  bool insecureDefault = true;
 
   bool get connected => state == 'CONNECTED';
   bool get busy => state == 'CONNECTING' || searching;
@@ -702,7 +710,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       retries = 0;
       Future.delayed(const Duration(seconds: 12), () {
         if (mounted && connected && dlTotal + upTotal == 0) {
-          snack('Connecté mais aucun trafic détecté. Essaie Configs > Diagnostiquer.');
+          snack('Connecté mais aucun trafic détecté. Touche Diagnostic complet.');
         }
       });
     }
@@ -768,7 +776,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       hotspot = p.getBool('hotspot') ?? false;
       preResolve = p.getBool('preResolve') ?? true;
       autoHost = p.getBool('autoHost') ?? true;
-      dnsTunnel = p.getBool('dnsTunnel') ?? true;
+      insecureDefault = p.getBool('insecureDefault') ?? true;
     });
     try {
       final t = await kChan.invokeMethod<String>('getInitial');
@@ -815,7 +823,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     await p.setBool('hotspot', hotspot);
     await p.setBool('preResolve', preResolve);
     await p.setBool('autoHost', autoHost);
-    await p.setBool('dnsTunnel', dnsTunnel);
+    await p.setBool('insecureDefault', insecureDefault);
   }
 
   void snack(String m) {
@@ -874,8 +882,11 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       if (outs is List && outs.isNotEmpty && outs[0] is Map) {
         final o = outs[0] as Map;
         final ss = o['streamSettings'];
-        if ((lf['ins'] == '1' || lf['ins'] == 'true') && ss is Map && ss['tlsSettings'] is Map) {
-          (ss['tlsSettings'] as Map)['allowInsecure'] = true;
+        final insRaw = lf['ins'] ?? '';
+        final insecure =
+            insRaw.isEmpty ? insecureDefault : (insRaw == '1' || insRaw.toLowerCase() == 'true');
+        if (ss is Map && ss['tlsSettings'] is Map) {
+          (ss['tlsSettings'] as Map)['allowInsecure'] = insecure;
         }
         final st = o['settings'];
         Map? target;
@@ -928,40 +939,13 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         }
         if (turbo) o['mux'] = {'enabled': true, 'concurrency': 8};
       }
-      final dnsBase = dns == 'google'
-          ? ['8.8.8.8', '8.8.4.4']
-          : dns == 'adguard'
-              ? ['94.140.14.14', '94.140.15.15']
-              : ['1.1.1.1', '1.0.0.1'];
-      if (dnsTunnel) {
-        // Les requêtes DNS venant d'Android (port 53) sont prises en charge par le moteur,
-        // qui les envoie en TCP à travers le serveur.
-        m['dns'] = {'servers': dnsBase.map((e) => 'tcp://$e').toList()};
-        final outsL = m['outbounds'];
-        if (outsL is List && !outsL.any((o) => o is Map && o['tag'] == 'dns-out')) {
-          outsL.add({'protocol': 'dns', 'tag': 'dns-out'});
-        }
-        final tags = <String>[];
-        final insL = m['inbounds'];
-        if (insL is List) {
-          for (final i in insL) {
-            if (i is Map && i['protocol'] == 'socks' && i['tag'] != null) tags.add('${i['tag']}');
-          }
-        }
-        final rt = m['routing'] is Map ? m['routing'] as Map : <String, dynamic>{};
-        final rules = rt['rules'] is List ? rt['rules'] as List : <dynamic>[];
-        if (!rules.any((r) => r is Map && r['outboundTag'] == 'dns-out')) {
-          rules.insert(0, {
-            'type': 'field',
-            'inboundTag': tags.isEmpty ? ['socks'] : tags,
-            'port': '53',
-            'outboundTag': 'dns-out',
-          });
-        }
-        rt['rules'] = rules;
-        m['routing'] = rt;
-      } else if (dns != 'auto') {
-        m['dns'] = {'servers': dnsBase};
+      if (dns != 'auto') {
+        final servers = dns == 'cloudflare'
+            ? ['1.1.1.1', '1.0.0.1']
+            : dns == 'google'
+                ? ['8.8.8.8', '8.8.4.4']
+                : ['94.140.14.14', '94.140.15.15'];
+        m['dns'] = {'servers': servers};
       }
       if (hotspot) {
         final ins = m['inbounds'];
@@ -1419,42 +1403,92 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     );
   }
 
-  Future<String> _tunnelReport() async {
-    final b = StringBuffer('\n--- Test du tunnel Android ---\n');
-    if (!connected) {
-      b.writeln('Connecte-toi d\'abord pour tester le tunnel.');
-      return b.toString();
-    }
-    var tcpOk = false;
-    for (final ip in ['1.1.1.1', '8.8.8.8']) {
-      final sw = Stopwatch()..start();
-      try {
-        final so = await Socket.connect(ip, 443, timeout: const Duration(seconds: 6));
-        so.destroy();
-        b.writeln('TCP $ip:443 (sans DNS) : OK (${sw.elapsedMilliseconds} ms)');
-        tcpOk = true;
-      } catch (e) {
-        b.writeln('TCP $ip:443 (sans DNS) : ECHEC');
-      }
-    }
-    var dnsOk = false;
-    final sw2 = Stopwatch()..start();
+  // Petit client SOCKS5 : demande une page au moteur par son entrée locale.
+  Future<String> _socksGet(int port) async {
+    final sw = Stopwatch()..start();
+    Socket? s;
     try {
-      final r = await InternetAddress.lookup('example.com').timeout(const Duration(seconds: 8));
-      dnsOk = r.isNotEmpty;
-      b.writeln('DNS example.com : OK -> ${r.first.address} (${sw2.elapsedMilliseconds} ms)');
+      s = await Socket.connect('127.0.0.1', port, timeout: const Duration(seconds: 6));
+      final buf = <int>[];
+      s.listen((d) => buf.addAll(d), onError: (_) {}, cancelOnError: true);
+      Future<bool> wait(int n) async {
+        for (var k = 0; k < 160 && buf.length < n; k++) {
+          await Future.delayed(const Duration(milliseconds: 50));
+        }
+        return buf.length >= n;
+      }
+
+      s.add([5, 1, 0]);
+      if (!await wait(2) || buf[0] != 5 || buf[1] != 0) {
+        return 'SOCKS 127.0.0.1:$port -> poignée de main refusée';
+      }
+      const host = 'connectivitycheck.gstatic.com';
+      final hb = utf8.encode(host);
+      s.add([5, 1, 0, 3, hb.length, ...hb, 0, 80]);
+      if (!await wait(4)) return 'SOCKS 127.0.0.1:$port -> pas de réponse du moteur';
+      if (buf[1] != 0) {
+        return 'SOCKS 127.0.0.1:$port -> le moteur refuse la connexion (code ${buf[1]})';
+      }
+      final atyp = buf[3];
+      final rl = atyp == 1 ? 10 : (atyp == 4 ? 22 : 7 + (buf.length > 4 ? buf[4] : 0));
+      if (!await wait(rl)) return 'SOCKS 127.0.0.1:$port -> réponse incomplète';
+      s.add(utf8.encode('GET /generate_204 HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n'));
+      if (!await wait(rl + 12)) {
+        return 'SOCKS 127.0.0.1:$port -> aucune réponse HTTP (délai dépassé)';
+      }
+      final end = min(buf.length, rl + 40);
+      final line =
+          utf8.decode(buf.sublist(rl, end), allowMalformed: true).split('\r\n').first;
+      return 'SOCKS 127.0.0.1:$port -> ${line.replaceFirst('HTTP/1.1 ', '')} '
+          '(${sw.elapsedMilliseconds} ms)';
     } catch (e) {
-      b.writeln('DNS example.com : ECHEC');
+      return 'SOCKS 127.0.0.1:$port -> ECHEC ${e.runtimeType}';
+    } finally {
+      s?.destroy();
     }
-    if (tcpOk && !dnsOk) {
-      b.writeln('=> Le tunnel passe, mais pas le DNS. Active « DNS via le tunnel » dans Réglages.');
-    } else if (!tcpOk && !dnsOk) {
-      b.writeln('=> Rien ne passe dans le tunnel Android. Le moteur marche : '
-          'le blocage vient du VPN du système (essaie sur un téléphone).');
-    } else {
-      b.writeln('=> Le tunnel Android laisse passer le trafic.');
+  }
+
+  // État du tunnel Android : le programme tun2socks est-il présent et en marche ?
+  Future<String> _nativeReport() async {
+    String r;
+    try {
+      r = await kChan.invokeMethod<String>('nativeInfo') ?? 'indisponible';
+    } catch (_) {
+      return '\n--- Tunnel Android ---\nindisponible (canal natif absent)\n';
+    }
+    final b = StringBuffer('\n--- Tunnel Android ---\n$r');
+    if (r.contains('ABSENT') || r.contains('AUCUN')) {
+      b.writeln('=> CAUSE TROUVÉE : le programme du tunnel (tun2socks) est introuvable.');
+      b.writeln('   Le VPN s\'allume mais ne peut rien transporter.');
+    } else if (r.contains('non trouvé')) {
+      b.writeln('=> Le programme existe mais ne tourne pas.');
+      b.writeln('   Connecte-toi d\'abord, puis relance ce diagnostic.');
+    } else if (r.contains('EN MARCHE')) {
+      b.writeln('=> Le tunnel tourne. Si rien ne passe, le blocage est ailleurs (DNS, UDP).');
     }
     return b.toString();
+  }
+
+  Future<void> tunnelInfo() async {
+    final t = await _nativeReport();
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Tunnel Android'),
+        content: SingleChildScrollView(child: SelectableText(t.trim())),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: t.trim()));
+              snack('Copié');
+            },
+            child: const Text('Copier'),
+          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer')),
+        ],
+      ),
+    );
   }
 
   Future<String> _coreReport(Cfg c) async {
@@ -1467,19 +1501,18 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final cfgJson = await buildConfig(p, c.link);
     var port = 10809;
     var hasHttp = false;
+    var socks = 10808;
     try {
       final m = jsonDecode(cfgJson) as Map<String, dynamic>;
       for (final i in (m['inbounds'] as List)) {
         if (i is Map && i['protocol'] == 'http') {
           port = toInt(i['port']);
           hasHttp = true;
+        } else if (i is Map && i['protocol'] == 'socks') {
+          socks = toInt(i['port']);
         }
       }
     } catch (_) {}
-    if (!hasHttp) {
-      b.writeln('Pas de proxy HTTP local dans cette config : test impossible.');
-      return b.toString();
-    }
     final wasOn = connected;
     if (!wasOn) {
       wantOn = false;
@@ -1499,7 +1532,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       b.writeln('Le moteur ne démarre pas : config refusée.');
     } else {
       var ok = false;
-      for (final url in [
+      if (!hasHttp) {
+        final r = await _socksGet(socks);
+        b.writeln(r);
+        ok = r.contains('-> 204') || r.contains('-> 200');
+      }
+      if (hasHttp) for (final url in [
         'http://connectivitycheck.gstatic.com/generate_204',
         'http://www.msftconnecttest.com/connecttest.txt'
       ]) {
@@ -1599,7 +1637,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ]),
       ),
     );
-    final report = (await _diagReport(c, i)) + (await _coreReport(c)) + (await _tunnelReport());
+    final report = (await _diagReport(c, i)) + (await _coreReport(c)) + (await _nativeReport());
     if (!mounted) return;
     Navigator.of(context).pop();
     showDialog(
@@ -1661,7 +1699,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 
   Future<void> newConfig() async {
     final r = await Navigator.push<Cfg>(
-        context, MaterialPageRoute(builder: (_) => const ConfigEditor()));
+        context, MaterialPageRoute(builder: (_) => ConfigEditor(defaultInsecure: insecureDefault)));
     if (r != null) {
       setState(() => configs.add(r));
       _save();
@@ -1845,7 +1883,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         await editDialog(i);
       } else {
         final r = await Navigator.push<Cfg>(
-            context, MaterialPageRoute(builder: (_) => ConfigEditor(cfg: c)));
+            context, MaterialPageRoute(builder: (_) => ConfigEditor(cfg: c, defaultInsecure: insecureDefault)));
         if (r != null) {
           setState(() {
             configs[i] = r;
@@ -2343,12 +2381,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             },
           ),
         ),
-        sw('DNS via le tunnel', 'Les noms de sites sont résolus par le serveur (corrige « connecté mais rien ne passe »)',
-            dnsTunnel, (v) => dnsTunnel = v),
         sw('Résoudre le serveur avant connexion',
             'Corrige les cas « connecté mais rien ne passe »', preResolve, (v) => preResolve = v),
         sw('Host automatique', 'Remplit un header host vide avec l\'adresse du serveur', autoHost,
             (v) => autoHost = v),
+        sw('Certificats non vérifiés par défaut', 'Comme V2Ray FastSSH (allowInsecure)',
+            insecureDefault, (v) => insecureDefault = v),
         sec('Mode et applis'),
         sw('Proxy seulement', 'Sans VPN système (pour apps compatibles)', proxyOnly,
             (v) => proxyOnly = v),
@@ -2445,6 +2483,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         sec('Diagnostic'),
         ListTile(
+          leading: const Icon(Icons.settings_ethernet),
+          title: const Text('Infos du tunnel (tun2socks)'),
+          subtitle: const Text('Connecte-toi d\'abord pour un résultat complet'),
+          onTap: tunnelInfo,
+        ),
+        ListTile(
           leading: const Icon(Icons.article_outlined),
           title: const Text('Logs'),
           trailing: const Icon(Icons.chevron_right),
@@ -2457,7 +2501,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v4.3'),
+          title: Text('OTAKU TUNNEL v5.0'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);

@@ -37,6 +37,32 @@ class MainActivity : FlutterActivity() {
                         .sortedBy { it["name"]!!.lowercase() }
                     result.success(list)
                 }
+                "nativeInfo" -> {
+                    val sb = StringBuilder()
+                    sb.appendLine("ABI du téléphone : " + android.os.Build.SUPPORTED_ABIS.joinToString(", "))
+                    val dir = applicationInfo.nativeLibraryDir
+                    sb.appendLine("Dossier natif : " + dir)
+                    val names = java.io.File(dir).list()
+                    if (names == null || names.isEmpty()) {
+                        sb.appendLine("Fichiers : AUCUN (bibliothèques non extraites)")
+                    } else {
+                        sb.appendLine("Fichiers : " + names.sorted().joinToString(", "))
+                    }
+                    val t2s = java.io.File(dir, "libtun2socks.so")
+                    if (t2s.exists()) {
+                        sb.appendLine("libtun2socks.so : présent, exécutable = " + t2s.canExecute())
+                    } else {
+                        sb.appendLine("libtun2socks.so : ABSENT")
+                    }
+                    try {
+                        val pr = Runtime.getRuntime().exec(arrayOf("sh", "-c", "ps -A 2>/dev/null | grep [l]ibtun2socks"))
+                        val out = pr.inputStream.bufferedReader().readText().trim()
+                        sb.appendLine("Processus tun2socks : " + (if (out.isEmpty()) "non trouvé" else "EN MARCHE"))
+                    } catch (e: Exception) {
+                        sb.appendLine("Processus tun2socks : lecture impossible")
+                    }
+                    result.success(sb.toString())
+                }
                 else -> result.notImplemented()
             }
         }

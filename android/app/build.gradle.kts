@@ -5,6 +5,11 @@ plugins {
 }
 
 android {
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
     namespace = "com.example.otaku_tunnel"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
