@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:cryptography/cryptography.dart' as cr;
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
@@ -120,9 +122,361 @@ List<double> hueMatrix(double deg) {
 
 const kChan = MethodChannel('otaku/intent');
 
-String skinAsset(int s) => s == 0
-    ? 'assets/images/mangekyo.png'
-    : 'assets/images/skins/s${s.toString().padLeft(2, '0')}.png';
+// ---------- Skins : œil du personnage + sa photo derrière ----------
+class Skin {
+  final String id;
+  String name;
+  final String file;
+  final bool asset;
+  final int w, h;
+  final double ex, ey, es; // centre de l'œil et côté du carré (fractions de la photo)
+  int color;
+  ImageProvider? mem;
+  Skin(this.id, this.name, this.file, this.asset, this.w, this.h, this.ex, this.ey, this.es,
+      this.color);
+
+  factory Skin.fromJson(Map<String, dynamic> j, bool asset) => Skin(
+        '${j['id']}',
+        '${j['name']}',
+        '${j['file']}',
+        asset,
+        toInt(j['w']),
+        toInt(j['h']),
+        (num.tryParse('${j['ex']}') ?? 0.5).toDouble(),
+        (num.tryParse('${j['ey']}') ?? 0.5).toDouble(),
+        (num.tryParse('${j['es']}') ?? 0.3).toDouble(),
+        toInt(j['color']) == 0 ? 0xFFE53935 : toInt(j['color']),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'file': file,
+        'w': w,
+        'h': h,
+        'ex': ex,
+        'ey': ey,
+        'es': es,
+        'color': color,
+      };
+
+  Color get aura => Color(color);
+  ImageProvider get provider =>
+      mem ?? (asset ? AssetImage(file) as ImageProvider : FileImage(File(file)));
+}
+
+// Cercle sur l'œil du personnage (recadrage fait à l'affichage, la photo n'est pas modifiée).
+class CharEye extends StatelessWidget {
+  final Skin skin;
+  final double size;
+  final bool ring;
+  const CharEye({super.key, required this.skin, required this.size, this.ring = true});
+
+  @override
+  Widget build(BuildContext context) {
+    final side = max(skin.es * skin.w, 8.0);
+    final scale = size / side;
+    final cx = skin.ex * skin.w, cy = skin.ey * skin.h;
+    final target = min(skin.w.toDouble(), size * 3 / max(skin.es, 0.05)).round();
+    final img = Image(
+      image: ResizeImage(skin.provider, width: target, allowUpscaling: false),
+      width: skin.w * scale,
+      height: skin.h * scale,
+      fit: BoxFit.fill,
+      filterQuality: FilterQuality.high,
+    );
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: Colors.black,
+        border: ring ? Border.all(color: skin.aura, width: max(2.0, size / 48)) : null,
+        boxShadow: ring
+            ? [BoxShadow(color: skin.aura.withValues(alpha: 0.7), blurRadius: size / 4)]
+            : null,
+      ),
+      child: ClipOval(
+        child: OverflowBox(
+          alignment: Alignment.topLeft,
+          minWidth: 0,
+          minHeight: 0,
+          maxWidth: double.infinity,
+          maxHeight: double.infinity,
+          child: Transform.translate(
+            offset: Offset(-(cx - side / 2) * scale, -(cy - side / 2) * scale),
+            child: img,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Photo du personnage en fond : assombrie, légèrement floutée (plus si elle est petite).
+class CharBackground extends StatelessWidget {
+  final Skin skin;
+  const CharBackground({super.key, required this.skin});
+
+  @override
+  Widget build(BuildContext context) {
+    final sigma = skin.w < 500 ? 2.6 : 1.2;
+    return Stack(fit: StackFit.expand, children: [
+      ImageFiltered(
+        imageFilter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+        child: Image(
+          image: ResizeImage(skin.provider, width: min(skin.w, 900), allowUpscaling: false),
+          fit: BoxFit.cover,
+          color: const Color(0xFF949494),
+          colorBlendMode: BlendMode.modulate,
+          filterQuality: FilterQuality.high,
+        ),
+      ),
+      DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              Colors.black.withValues(alpha: 0.55),
+              Colors.transparent,
+              Colors.transparent,
+              Colors.black.withValues(alpha: 0.85),
+            ],
+            stops: const [0, 0.16, 0.5, 1],
+          ),
+        ),
+      ),
+    ]);
+  }
+}
+
+// Créateur de skin : choisis ta photo, place le cercle sur l'œil, donne un nom.
+class SkinMaker extends StatefulWidget {
+  const SkinMaker({super.key});
+  @override
+  State<SkinMaker> createState() => _SkinMakerState();
+}
+
+class _SkinMakerState extends State<SkinMaker> {
+  Uint8List? bytes;
+  String ext = 'jpg';
+  int iw = 0, ih = 0;
+  double ex = 0.5, ey = 0.4, es = 0.3;
+  int color = 0xFFE53935, autoColor = 0xFFE53935;
+  final name = TextEditingController();
+  bool busy = false;
+
+  static const palette = [
+    0xFFE53935, 0xFFFF9800, 0xFFFFC107, 0xFF4CAF50, 0xFF00BCD4,
+    0xFF2196F3, 0xFF9C27B0, 0xFFE91E63, 0xFFFFFFFF,
+  ];
+
+  void _msg(String m) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  int _auto(ByteData bd) {
+    final hist = List<double>.filled(36, 0);
+    for (var i = 0; i + 3 < bd.lengthInBytes; i += 4) {
+      final hsv = HSVColor.fromColor(
+          Color.fromARGB(255, bd.getUint8(i), bd.getUint8(i + 1), bd.getUint8(i + 2)));
+      if (hsv.saturation > 0.5 && hsv.value > 0.5) {
+        hist[(hsv.hue ~/ 10) % 36] += hsv.saturation * hsv.value;
+      }
+    }
+    var best = 0;
+    for (var i = 1; i < 36; i++) {
+      if (hist[i] > hist[best]) best = i;
+    }
+    if (hist[best] == 0) return 0xFFE53935;
+    return HSVColor.fromAHSV(1, best * 10 + 5.0, 0.85, 1).toColor().toARGB32();
+  }
+
+  Future<void> pick() async {
+    try {
+      final f = await openFile(acceptedTypeGroups: [
+        XTypeGroup(
+            label: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp'], mimeTypes: ['image/*'])
+      ]);
+      if (f == null) return;
+      final b = await f.readAsBytes();
+      final c1 = await ui.instantiateImageCodec(b);
+      final f1 = await c1.getNextFrame();
+      final w = f1.image.width, h = f1.image.height;
+      f1.image.dispose();
+      final c2 = await ui.instantiateImageCodec(b, targetWidth: 64);
+      final f2 = await c2.getNextFrame();
+      final bd = await f2.image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      final ac = bd == null ? 0xFFE53935 : _auto(bd);
+      final dot = f.name.lastIndexOf('.');
+      final e = dot >= 0 ? f.name.substring(dot + 1).toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '') : '';
+      if (!mounted) return;
+      setState(() {
+        bytes = b;
+        iw = w;
+        ih = h;
+        ext = e.isEmpty ? 'jpg' : e;
+        ex = 0.5;
+        ey = 0.4;
+        es = 0.3;
+        autoColor = ac;
+        color = ac;
+        if (name.text.isEmpty) {
+          final base = dot > 0 ? f.name.substring(0, dot) : f.name;
+          name.text = base.length > 18 ? base.substring(0, 18) : base;
+        }
+      });
+    } catch (_) {
+      if (mounted) _msg('Photo illisible');
+    }
+  }
+
+  Future<void> save() async {
+    final b = bytes;
+    if (b == null || iw == 0) return _msg('Choisis d\'abord une photo');
+    setState(() => busy = true);
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final sd = Directory('${dir.path}/skins');
+      if (!sd.existsSync()) sd.createSync(recursive: true);
+      final id = 'u${DateTime.now().millisecondsSinceEpoch}';
+      final path = '${sd.path}/$id.$ext';
+      await File(path).writeAsBytes(b);
+      final n = name.text.trim().isEmpty ? 'Mon skin' : name.text.trim();
+      if (!mounted) return;
+      Navigator.pop(context, Skin(id, n, path, false, iw, ih, ex, ey, es, color));
+    } catch (_) {
+      if (mounted) {
+        setState(() => busy = false);
+        _msg('Enregistrement impossible');
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final b = bytes;
+    Skin? tmp;
+    if (b != null) {
+      tmp = Skin('tmp', '', '', false, iw, ih, ex, ey, es, color)..mem = MemoryImage(b);
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Créer un skin'),
+        actions: [TextButton(onPressed: busy ? null : save, child: const Text('Enregistrer'))],
+      ),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        OutlinedButton.icon(
+          onPressed: pick,
+          icon: const Icon(Icons.photo_library),
+          label: Text(b == null ? 'Choisir une photo' : 'Changer de photo'),
+        ),
+        if (tmp != null) ...[
+          const SizedBox(height: 12),
+          const Text('Touche ou glisse sur la photo pour placer le cercle sur l\'œil.',
+              style: TextStyle(color: Colors.white60, fontSize: 12)),
+          const SizedBox(height: 8),
+          LayoutBuilder(builder: (ctx, bc) {
+            const bh = 340.0;
+            final bw = bc.maxWidth;
+            final ar = iw / ih;
+            final dw = (bw / bh > ar) ? bh * ar : bw;
+            final dh = (bw / bh > ar) ? bh : bw / ar;
+            final ox = (bw - dw) / 2, oy = (bh - dh) / 2;
+            void place(Offset p) => setState(() {
+                  ex = ((p.dx - ox) / dw).clamp(0.0, 1.0);
+                  ey = ((p.dy - oy) / dh).clamp(0.0, 1.0);
+                });
+            final r = es * dw / 2;
+            return SizedBox(
+              width: bw,
+              height: bh,
+              child: GestureDetector(
+                onTapDown: (d) => place(d.localPosition),
+                onPanUpdate: (d) => place(d.localPosition),
+                child: Stack(children: [
+                  Positioned(
+                    left: ox,
+                    top: oy,
+                    width: dw,
+                    height: dh,
+                    child: Image(image: MemoryImage(b!), fit: BoxFit.fill),
+                  ),
+                  Positioned(
+                    left: ox + ex * dw - r,
+                    top: oy + ey * dh - r,
+                    width: r * 2,
+                    height: r * 2,
+                    child: IgnorePointer(
+                      child: Container(
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Color(color), width: 3),
+                        ),
+                      ),
+                    ),
+                  ),
+                ]),
+              ),
+            );
+          }),
+          const SizedBox(height: 8),
+          Row(children: [
+            const Text('Taille'),
+            Expanded(
+              child: Slider(
+                value: es,
+                min: 0.05,
+                max: 0.9,
+                onChanged: (v) => setState(() => es = v),
+              ),
+            ),
+          ]),
+          if (es * iw < 90)
+            const Text('Photo petite à cet endroit : l\'œil sera un peu flou. Agrandis le cercle.',
+                style: TextStyle(color: Colors.orangeAccent, fontSize: 12)),
+          const SizedBox(height: 8),
+          Center(child: CharEye(skin: tmp, size: 160)),
+          const SizedBox(height: 12),
+          TextField(
+            controller: name,
+            decoration: const InputDecoration(
+                labelText: 'Nom du personnage', border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 12),
+          const Text('Couleur de l\'aura'),
+          const SizedBox(height: 6),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            GestureDetector(
+              onTap: () => setState(() => color = autoColor),
+              child: Chip(label: const Text('Auto'), backgroundColor: Color(autoColor)),
+            ),
+            for (final c in palette)
+              GestureDetector(
+                onTap: () => setState(() => color = c),
+                child: Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Color(c),
+                    border: Border.all(
+                        color: color == c ? Colors.white : Colors.transparent, width: 3),
+                  ),
+                ),
+              ),
+          ]),
+          const SizedBox(height: 16),
+          FilledButton(
+            onPressed: busy ? null : save,
+            style: FilledButton.styleFrom(backgroundColor: kRed),
+            child: const Text('Enregistrer le skin'),
+          ),
+        ],
+      ]),
+    );
+  }
+}
 
 List<int> b64dec(String s) {
   final t = s.trim().replaceAll('-', '+').replaceAll('_', '/');
@@ -640,7 +994,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   bool autoConnect = false, mangekyoColor = true;
   String dns = 'auto';
   String excluded = '';
-  int skin = 0;
+  String skinId = 'classic';
+  List<Skin> skins = [];
+  Map<String, String> skinNames = {};
   bool hotspot = false;
   bool preResolve = true, autoHost = true;
   bool insecureDefault = true;
@@ -781,12 +1137,13 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       autoConnect = p.getBool('autoConnect') ?? false;
       mangekyoColor = p.getBool('mangekyoColor') ?? true;
       excluded = p.getString('excluded') ?? '';
-      skin = p.getInt('skin') ?? 0;
+      skinId = p.getString('skinId') ?? 'classic';
       hotspot = p.getBool('hotspot') ?? false;
       preResolve = p.getBool('preResolve') ?? true;
       autoHost = p.getBool('autoHost') ?? true;
       insecureDefault = p.getBool('insecureDefault') ?? true;
     });
+    await _loadSkins(p);
     try {
       final t = await kChan.invokeMethod<String>('getInitial');
       if (t != null && t.isNotEmpty) await _incoming(t);
@@ -828,7 +1185,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     await p.setBool('autoConnect', autoConnect);
     await p.setBool('mangekyoColor', mangekyoColor);
     await p.setString('excluded', excluded);
-    await p.setInt('skin', skin);
+    await p.setString('skinId', skinId);
     await p.setBool('hotspot', hotspot);
     await p.setBool('preResolve', preResolve);
     await p.setBool('autoHost', autoHost);
@@ -1827,42 +2184,163 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     );
   }
 
-  void skinDialog() {
-    showDialog(
+  Skin? get curSkin {
+    if (skinId == 'classic') return null;
+    for (final k in skins) {
+      if (k.id == skinId) return k;
+    }
+    return null;
+  }
+
+  Future<void> _loadSkins(SharedPreferences p) async {
+    final out = <Skin>[];
+    final names = <String, String>{};
+    try {
+      final m = jsonDecode(p.getString('skinNames') ?? '{}') as Map<String, dynamic>;
+      m.forEach((k, v) => names[k] = '$v');
+    } catch (_) {}
+    try {
+      final raw = await rootBundle.loadString('assets/chars/chars.json');
+      for (final e in (jsonDecode(raw) as List)) {
+        out.add(Skin.fromJson(Map<String, dynamic>.from(e as Map), true));
+      }
+    } catch (_) {}
+    try {
+      for (final e in (jsonDecode(p.getString('userSkins') ?? '[]') as List)) {
+        final k = Skin.fromJson(Map<String, dynamic>.from(e as Map), false);
+        if (File(k.file).existsSync()) out.add(k);
+      }
+    } catch (_) {}
+    for (final k in out) {
+      final n = names[k.id];
+      if (n != null && n.isNotEmpty) k.name = n;
+    }
+    if (!mounted) return;
+    setState(() {
+      skins = out;
+      skinNames = names;
+      if (skinId != 'classic' && !out.any((k) => k.id == skinId)) skinId = 'classic';
+    });
+  }
+
+  Future<void> _saveSkins() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString(
+        'userSkins', jsonEncode(skins.where((k) => !k.asset).map((k) => k.toJson()).toList()));
+    await p.setString('skinNames', jsonEncode(skinNames));
+    await p.setString('skinId', skinId);
+  }
+
+  Future<void> createSkin() async {
+    final r = await Navigator.push<Skin>(
+        context, MaterialPageRoute(builder: (_) => const SkinMaker()));
+    if (r == null) return;
+    setState(() {
+      skins.add(r);
+      skinId = r.id;
+    });
+    await _saveSkins();
+    snack('Skin créé : ${r.name}');
+  }
+
+  Future<void> skinMenu(Skin k) async {
+    final v = await showModalBottomSheet<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Skin du Mangekyō'),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: GridView.count(
-            crossAxisCount: 4,
-            shrinkWrap: true,
-            mainAxisSpacing: 8,
-            crossAxisSpacing: 8,
-            children: [
-              for (var s = 0; s <= 14; s++)
-                GestureDetector(
-                  onTap: () {
-                    setState(() => skin = s);
-                    _saveSettings();
-                    Navigator.pop(ctx);
-                  },
-                  child: Container(
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      border: Border.all(
-                          color: skin == s ? kRed : Colors.transparent, width: 3),
-                    ),
-                    child: ClipOval(child: Image.asset(skinAsset(s))),
-                  ),
-                ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer'))
-        ],
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+              leading: const Icon(Icons.edit),
+              title: const Text('Renommer'),
+              onTap: () => Navigator.pop(ctx, 'rename')),
+          if (!k.asset)
+            ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Supprimer'),
+                onTap: () => Navigator.pop(ctx, 'del')),
+        ]),
       ),
+    );
+    if (v == 'rename') {
+      final n = await askText('Nom du skin', k.name);
+      if (n != null && n.trim().isNotEmpty) {
+        setState(() {
+          k.name = n.trim();
+          if (k.asset) skinNames[k.id] = k.name;
+        });
+        _saveSkins();
+      }
+    } else if (v == 'del') {
+      try {
+        File(k.file).deleteSync();
+      } catch (_) {}
+      setState(() {
+        skins.remove(k);
+        if (skinId == k.id) skinId = 'classic';
+      });
+      _saveSkins();
+    }
+  }
+
+  Future<void> skinDialog() async {
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) {
+        Widget tile(String id, String nm, Widget thumb, {Skin? k}) => GestureDetector(
+              onTap: () {
+                setState(() => skinId = id);
+                _saveSkins();
+                Navigator.pop(ctx);
+              },
+              onLongPress: k == null
+                  ? null
+                  : () async {
+                      await skinMenu(k);
+                      setD(() {});
+                    },
+              child: Column(children: [
+                Container(
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(color: skinId == id ? kRed : Colors.transparent, width: 3),
+                  ),
+                  padding: const EdgeInsets.all(2),
+                  child: thumb,
+                ),
+                const SizedBox(height: 2),
+                Text(nm,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 10)),
+              ]),
+            );
+        return AlertDialog(
+          title: const Text('Skins'),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 420,
+            child: GridView.count(
+              crossAxisCount: 4,
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 0.78,
+              children: [
+                tile('classic', 'Classique',
+                    ClipOval(child: Image.asset('assets/images/mangekyo.png', width: 64, height: 64))),
+                for (final k in skins) tile(k.id, k.name, CharEye(skin: k, size: 64, ring: false), k: k),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  createSkin();
+                },
+                child: const Text('Créer un skin')),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer')),
+          ],
+        );
+      }),
     );
   }
 
@@ -2141,7 +2619,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final deg = mangekyoColor ? [0.0, 260.0, 200.0, 120.0, 40.0, 310.0][sel % 6] : 0.0;
     final glow = connected ? HSLColor.fromAHSL(1, deg, 0.85, 0.5).toColor() : kRed;
     Widget img = Image.asset(
-        connected ? skinAsset(skin) : 'assets/images/sharingan.png');
+        connected ? 'assets/images/mangekyo.png' : 'assets/images/sharingan.png');
     if (connected && deg != 0) {
       img = ColorFiltered(colorFilter: ColorFilter.matrix(hueMatrix(deg)), child: img);
     }
@@ -2155,24 +2633,69 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     );
   }
 
+  // Œil du personnage au centre, halo et anneaux qui pulsent dans la couleur de l'aura.
+  Widget charEye(Skin k) => AnimatedBuilder(
+        animation: spin,
+        child: CharEye(skin: k, size: 190),
+        builder: (_, child) {
+          final t = sin(spin.value * 2 * pi);
+          final pulse = 1 + 0.035 * t;
+          return SizedBox(
+            width: 300,
+            height: 300,
+            child: Stack(alignment: Alignment.center, children: [
+              Container(
+                width: 215 * pulse,
+                height: 215 * pulse,
+                decoration: BoxDecoration(shape: BoxShape.circle, boxShadow: [
+                  BoxShadow(color: k.aura.withValues(alpha: 0.75), blurRadius: 70, spreadRadius: 14),
+                ]),
+              ),
+              for (final r in [(216.0, 0.8), (250.0, 0.5), (284.0, 0.28)])
+                Container(
+                  width: r.$1 * pulse,
+                  height: r.$1 * pulse,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(color: k.aura.withValues(alpha: r.$2), width: 2),
+                  ),
+                ),
+              child!,
+            ]),
+          );
+        },
+      );
+
   Widget connectionTab() {
     final c = configs.isEmpty ? null : configs[sel];
     final p = c == null ? null : parse(c.link);
+    final cs = curSkin;
     final statusText = connected
-        ? 'Mangekyō activé'
+        ? (cs != null ? 'Aura activée' : 'Mangekyō activé')
         : searching
             ? 'Recherche du meilleur serveur...'
             : busy
                 ? 'Activation...'
                 : 'Touche le Sharingan';
-    return ListView(padding: const EdgeInsets.all(16), children: [
+    return Stack(children: [
+      if (cs != null)
+        Positioned.fill(
+          child: IgnorePointer(
+            child: AnimatedOpacity(
+              opacity: connected ? 1 : 0,
+              duration: const Duration(milliseconds: 700),
+              child: CharBackground(skin: cs),
+            ),
+          ),
+        ),
+      ListView(padding: const EdgeInsets.all(16), children: [
       const Text('Connexion', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
       const SizedBox(height: 12),
       Container(
         padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(24),
-          gradient: const LinearGradient(
+          gradient: (cs != null && connected) ? null : const LinearGradient(
               colors: [Color(0xFF2A0508), Color(0xFF0A0A0F)],
               begin: Alignment.topLeft,
               end: Alignment.bottomRight),
@@ -2190,10 +2713,18 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           const SizedBox(height: 16),
           GestureDetector(
             onTap: toggle,
-            child: RotationTransition(turns: spin, child: eye()),
+            child: (cs != null && connected)
+                ? charEye(cs)
+                : RotationTransition(turns: spin, child: eye()),
           ),
           const SizedBox(height: 16),
           Text(statusText, style: const TextStyle(color: Colors.white70)),
+          if (cs != null && connected)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text('Skin : ${cs.name}',
+                  style: TextStyle(color: cs.aura, fontWeight: FontWeight.bold, fontSize: 18)),
+            ),
           const SizedBox(height: 12),
           if (connected)
             statsPanel()
@@ -2270,6 +2801,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       const Center(
           child: Text('Créé par APPOH GODWIN — HACKER GODWIN',
               style: TextStyle(color: Colors.white38, fontSize: 12))),
+      ]),
     ]);
   }
 
@@ -2464,8 +2996,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             (v) => mangekyoColor = v),
         ListTile(
           leading: const Icon(Icons.remove_red_eye),
-          title: const Text('Skin du Mangekyō'),
-          subtitle: Text(skin == 0 ? 'Classique' : 'Skin $skin'),
+          title: const Text('Skin : œil + photo du personnage'),
+          subtitle: Text(curSkin?.name ?? 'Classique (Sharingan puis Mangekyō)'),
           onTap: skinDialog,
         ),
         sec('Abonnements'),
@@ -2547,7 +3079,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v5.1'),
+          title: Text('OTAKU TUNNEL v6.0'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
