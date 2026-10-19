@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:dartssh2/dartssh2.dart' as ssh;
 import 'package:cryptography/cryptography.dart' as cr;
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
@@ -549,6 +550,39 @@ Map<String, String>? parseLink(String link) {
       });
       return f;
     }
+    if (l.startsWith('ssh://')) {
+      final body = l.substring(6);
+      try {
+        final j = jsonDecode(utf8.decode(b64dec(body))) as Map<String, dynamic>;
+        return {
+          'proto': 'ssh',
+          'remark': '${j['n'] ?? ''}',
+          'add': '${j['h'] ?? ''}',
+          'port': '${j['port'] ?? 22}',
+          'user': '${j['u'] ?? ''}',
+          'id': '${j['p'] ?? ''}',
+          'mode': '${j['m'] ?? 'direct'}',
+          'sni': '${j['sni'] ?? ''}',
+          'payload': '${j['pl'] ?? ''}',
+          'rproxy': '${j['rp'] ?? ''}',
+        };
+      } catch (_) {
+        final u = Uri.parse(l);
+        final ui = u.userInfo.split(':');
+        return {
+          'proto': 'ssh',
+          'remark': Uri.decodeComponent(u.fragment),
+          'add': u.host,
+          'port': '${u.hasPort ? u.port : 22}',
+          'user': Uri.decodeComponent(ui.first),
+          'id': ui.length > 1 ? Uri.decodeComponent(ui.sublist(1).join(':')) : '',
+          'mode': 'direct',
+          'sni': '',
+          'payload': '',
+          'rproxy': '',
+        };
+      }
+    }
     if (l.startsWith('ss://')) {
       var rest = l.substring(5);
       var remark = '';
@@ -652,6 +686,20 @@ String? buildLink(Map<String, String> f) {
       fragment: remark.isEmpty ? null : remark,
     ).toString();
   }
+  if (p == 'ssh') {
+    final j = {
+      'n': remark,
+      'h': f['add'],
+      'port': (f['port'] ?? '').isEmpty ? 22 : port,
+      'u': f['user'] ?? '',
+      'p': f['id'] ?? '',
+      'm': f['mode'] ?? 'direct',
+      'sni': f['sni'] ?? '',
+      'pl': f['payload'] ?? '',
+      'rp': f['rproxy'] ?? '',
+    };
+    return 'ssh://${base64Encode(utf8.encode(jsonEncode(j)))}';
+  }
   if (p == 'ss') {
     final cred = base64Encode(utf8.encode('${f['method'] ?? 'aes-256-gcm'}:${f['id'] ?? ''}'));
     final raw = f['x_raw'] ?? '';
@@ -674,6 +722,7 @@ class ConfigEditor extends StatefulWidget {
 class _ConfigEditorState extends State<ConfigEditor> {
   late String proto;
   String net = 'ws', tls = 'tls', vtype = 'none';
+  String smode = 'direct';
   bool insecure = false;
   final Map<String, TextEditingController> c = {};
   final Map<String, String> extra = {};
@@ -681,7 +730,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
 
   static const keys = [
     'remark', 'add', 'port', 'id', 'aid', 'scn', 'host', 'path', 'sni', 'alpn', 'fp',
-    'flow', 'enc', 'svc', 'method', 'expiry', 'limit'
+    'flow', 'enc', 'svc', 'method', 'expiry', 'limit', 'user', 'payload', 'rproxy'
   ];
 
   @override
@@ -702,6 +751,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
       net = f['net'] ?? 'tcp';
       tls = f['tls'] ?? '';
       vtype = f['type'] ?? 'none';
+      smode = f['mode'] ?? 'direct';
       final ir = f['ins'] ?? '';
       insecure = ir.isEmpty ? widget.defaultInsecure : (ir == '1' || ir.toLowerCase() == 'true');
       c['expiry']!.text = cf.expiry;
@@ -721,6 +771,14 @@ class _ConfigEditorState extends State<ConfigEditor> {
     net = 'ws';
     tls = 'tls';
     insecure = widget.defaultInsecure;
+    if (proto == 'ssh') {
+      c['port']!.text = '22';
+      smode = 'direct';
+      if (c['payload']!.text.isEmpty) {
+        c['payload']!.text =
+            'GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]';
+      }
+    }
   }
 
   void _err(String m) =>
@@ -733,12 +791,17 @@ class _ConfigEditorState extends State<ConfigEditor> {
     }
     f.addAll(extra);
     f['ins'] = insecure ? '1' : '0';
+    f['mode'] = smode;
     final link = buildLink(f);
     if (link == null) return _err('Le serveur cible est obligatoire');
-    try {
-      FlutterV2ray.parseFromURL(link);
-    } catch (_) {
-      return _err('Config invalide : vérifie les champs');
+    if (proto == 'ssh') {
+      if ((f['user'] ?? '').isEmpty) return _err('Utilisateur SSH obligatoire');
+    } else {
+      try {
+        FlutterV2ray.parseFromURL(link);
+      } catch (_) {
+        return _err('Config invalide : vérifie les champs');
+      }
     }
     final ex = c['expiry']!.text.trim();
     if (ex.isNotEmpty && !validDate(ex)) {
@@ -756,11 +819,12 @@ class _ConfigEditorState extends State<ConfigEditor> {
     );
   }
 
-  Widget field(String k, String label, {TextInputType? type}) => Padding(
+  Widget field(String k, String label, {TextInputType? type, int lines = 1}) => Padding(
         padding: const EdgeInsets.only(bottom: 10),
         child: TextField(
           controller: c[k],
           keyboardType: type,
+          maxLines: lines,
           decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
         ),
       );
@@ -798,12 +862,18 @@ class _ConfigEditorState extends State<ConfigEditor> {
         ),
         body: ListView(padding: const EdgeInsets.all(16), children: [
           if (isNew)
-            drop('Protocole', proto, ['vmess', 'vless', 'trojan', 'ss'],
+            drop('Protocole', proto, ['vmess', 'vless', 'trojan', 'ss', 'ssh'],
                 (v) => setState(() {
                       proto = v;
                       _defaults();
                     }),
-                names: {'vmess': 'VMess', 'vless': 'VLESS', 'trojan': 'Trojan', 'ss': 'Shadowsocks'}),
+                names: {
+                  'vmess': 'VMess',
+                  'vless': 'VLESS',
+                  'trojan': 'Trojan',
+                  'ss': 'Shadowsocks',
+                  'ssh': 'SSH (tunnel)'
+                }),
           field('remark', 'Nom'),
           field('add', 'Serveur cible (target)'),
           field('port', 'Port', type: TextInputType.number),
@@ -822,11 +892,28 @@ class _ConfigEditorState extends State<ConfigEditor> {
             field('flow', 'Flow (facultatif)'),
           ],
           if (proto == 'trojan') field('id', 'Mot de passe'),
+          if (proto == 'ssh') ...[
+            field('user', 'Utilisateur SSH'),
+            field('id', 'Mot de passe'),
+            drop('Mode de connexion', smode, ['direct', 'ssl', 'payload', 'ssl+payload'],
+                (v) => setState(() => smode = v),
+                names: {
+                  'direct': 'SSH direct',
+                  'ssl': 'SSH + SSL/TLS (SNI)',
+                  'payload': 'SSH + payload HTTP',
+                  'ssl+payload': 'SSH + SSL + payload'
+                }),
+            if (smode.contains('ssl')) field('sni', 'SNI (nom affiché au serveur)'),
+            if (smode.contains('payload')) ...[
+              field('payload', 'Payload ([crlf] [host] [host_port] [split])', lines: 4),
+              field('rproxy', 'Proxy distant host:port (facultatif)'),
+            ],
+          ],
           if (proto == 'ss') ...[
             field('method', 'Méthode (ex : aes-256-gcm)'),
             field('id', 'Mot de passe'),
           ],
-          if (proto != 'ss') ...[
+          if (proto != 'ss' && proto != 'ssh') ...[
             drop('Réseau', net, ['tcp', 'ws', 'grpc', 'h2', 'httpupgrade', 'kcp', 'quic'],
                 (v) => setState(() => net = v)),
             drop('En-tête (head type)', vtype,
@@ -861,6 +948,359 @@ class _ConfigEditorState extends State<ConfigEditor> {
           ),
         ]),
       );
+}
+
+// ---------- Config Xray de base (SSH, WireGuard) ----------
+const kSshPort = 10810;
+
+Map<String, dynamic> xrayBase(Map<String, dynamic> proxy, {required bool tcpOnly}) => {
+      'log': {'loglevel': 'warning'},
+      'stats': {},
+      'policy': {
+        'levels': {
+          '8': {'connIdle': 300, 'uplinkOnly': 1, 'downlinkOnly': 1}
+        },
+        'system': {'statsOutboundUplink': true, 'statsOutboundDownlink': true}
+      },
+      'dns': {
+        'servers': tcpOnly
+            ? ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query']
+            : ['1.1.1.1', '8.8.8.8'],
+        'queryStrategy': 'UseIPv4'
+      },
+      'inbounds': [
+        {
+          'tag': 'socks',
+          'port': 10808,
+          'listen': '127.0.0.1',
+          'protocol': 'socks',
+          'settings': {'auth': 'noauth', 'udp': true, 'userLevel': 8},
+          'sniffing': {
+            'enabled': true,
+            'destOverride': ['http', 'tls']
+          }
+        },
+        {
+          'tag': 'http',
+          'port': 10809,
+          'listen': '127.0.0.1',
+          'protocol': 'http',
+          'settings': {'userLevel': 8}
+        },
+      ],
+      'outbounds': [
+        proxy,
+        {'tag': 'direct', 'protocol': 'freedom', 'settings': {}},
+        {'tag': 'block', 'protocol': 'blackhole', 'settings': {}},
+        {'tag': 'dns-out', 'protocol': 'dns'},
+      ],
+      'routing': {
+        'domainStrategy': 'IPIfNonMatch',
+        'rules': tcpOnly
+            ? [
+                {'type': 'field', 'port': '53', 'outboundTag': 'dns-out'},
+                {'type': 'field', 'network': 'udp', 'outboundTag': 'block'},
+              ]
+            : [],
+      },
+    };
+
+// Un tunnel SSH est exposé en SOCKS local (kSshPort) ; le moteur s'y branche.
+String sshXrayJson() => jsonEncode(xrayBase({
+      'tag': 'proxy',
+      'protocol': 'socks',
+      'settings': {
+        'servers': [
+          {'address': '127.0.0.1', 'port': kSshPort}
+        ]
+      }
+    }, tcpOnly: true));
+
+// Fichier WireGuard (.conf) -> config Xray
+Map<String, dynamic>? wgToXray(String text) {
+  final iface = <String, String>{};
+  final peer = <String, String>{};
+  var cur = '';
+  for (final raw in text.split(RegExp(r'[\r\n]+'))) {
+    final l = raw.trim();
+    if (l.isEmpty || l.startsWith('#') || l.startsWith(';')) continue;
+    if (l.startsWith('[')) {
+      cur = l.toLowerCase();
+      continue;
+    }
+    final i = l.indexOf('=');
+    if (i < 0) continue;
+    final k = l.substring(0, i).trim().toLowerCase();
+    final v = l.substring(i + 1).trim();
+    if (cur == '[interface]') {
+      iface[k] = v;
+    } else if (cur == '[peer]') {
+      peer[k] = v;
+    }
+  }
+  final sk = iface['privatekey'], pk = peer['publickey'], ep = peer['endpoint'];
+  if (sk == null || pk == null || ep == null) return null;
+  List<String> split(String? v, String d) =>
+      (v ?? d).split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+  final p = <String, dynamic>{
+    'publicKey': pk,
+    'endpoint': ep,
+    'allowedIPs': split(peer['allowedips'], '0.0.0.0/0, ::/0'),
+  };
+  if (peer['presharedkey'] != null) p['preSharedKey'] = peer['presharedkey'];
+  final cfg = xrayBase({
+    'tag': 'proxy',
+    'protocol': 'wireguard',
+    'settings': {
+      'secretKey': sk,
+      'address': split(iface['address'], '10.0.0.2/32'),
+      'peers': [p],
+      'mtu': int.tryParse(iface['mtu'] ?? '') ?? 1280,
+    }
+  }, tcpOnly: false);
+  final host = ep.contains(':') ? ep.substring(0, ep.lastIndexOf(':')) : ep;
+  cfg['remarks'] = 'WireGuard $host';
+  return cfg;
+}
+
+// ---------- Tunnel SSH (direct, SSL/SNI, payload HTTP) ----------
+List<String> expandPayload(String p, String host, int port) {
+  var raw = p;
+  if (!raw.contains('[crlf]') && !raw.contains('[lf]')) {
+    raw = raw.replaceAll('\r\n', '\n').replaceAll('\n', '\r\n');
+  }
+  final s = raw
+      .replaceAll('[crlf]', '\r\n')
+      .replaceAll('[lf]', '\n')
+      .replaceAll('[cr]', '\r')
+      .replaceAll('[host_port]', '$host:$port')
+      .replaceAll('[host]', host)
+      .replaceAll('[port]', '$port')
+      .replaceAll('[protocol]', 'HTTP/1.1')
+      .replaceAll('[ua]', 'Mozilla/5.0');
+  return s.split('[split]');
+}
+
+class _Remote {
+  final Socket socket;
+  final Stream<Uint8List> stream;
+  _Remote(this.socket, this.stream);
+}
+
+// Ouvre la connexion vers le serveur SSH : TCP, éventuellement TLS (SNI), éventuellement
+// payload HTTP (le flux SSH commence après la réponse du serveur).
+Future<_Remote> openRemote(Map<String, String> f, void Function(String) log) async {
+  final host = f['add'] ?? '';
+  final port = int.tryParse(f['port'] ?? '') ?? 22;
+  final mode = f['mode'] ?? 'direct';
+  final useSsl = mode.contains('ssl');
+  final usePayload = mode.contains('payload');
+  var th = host;
+  var tp = port;
+  final rp = (f['rproxy'] ?? '').trim();
+  if (usePayload && rp.contains(':')) {
+    th = rp.substring(0, rp.lastIndexOf(':'));
+    tp = int.tryParse(rp.substring(rp.lastIndexOf(':') + 1)) ?? port;
+  }
+  Socket sock = await Socket.connect(th, tp, timeout: const Duration(seconds: 10));
+  sock.setOption(SocketOption.tcpNoDelay, true);
+  if (useSsl) {
+    final sni = (f['sni'] ?? '').trim().isEmpty ? th : (f['sni'] ?? '').trim();
+    sock = await SecureSocket.secure(sock, host: sni, onBadCertificate: (_) => true);
+  }
+  final ctl = StreamController<Uint8List>();
+  final hdr = Completer<String>();
+  final buf = <int>[];
+  var inHeader = usePayload;
+  sock.listen((d) {
+    if (inHeader) {
+      buf.addAll(d);
+      var end = -1;
+      for (var i = 0; i + 3 < buf.length; i++) {
+        if (buf[i] == 13 && buf[i + 1] == 10 && buf[i + 2] == 13 && buf[i + 3] == 10) {
+          end = i;
+          break;
+        }
+      }
+      if (end >= 0) {
+        inHeader = false;
+        final head = utf8.decode(buf.sublist(0, end), allowMalformed: true);
+        final rest = buf.sublist(end + 4);
+        if (!hdr.isCompleted) hdr.complete(head);
+        if (rest.isNotEmpty) ctl.add(Uint8List.fromList(rest));
+      }
+    } else {
+      ctl.add(d);
+    }
+  }, onDone: () {
+    if (!hdr.isCompleted) hdr.completeError('connexion fermée par le serveur');
+    ctl.close();
+  }, onError: (Object e) {
+    if (!hdr.isCompleted) hdr.completeError(e);
+    ctl.addError(e);
+    ctl.close();
+  }, cancelOnError: true);
+  if (usePayload) {
+    final parts = expandPayload(f['payload'] ?? '', host, port);
+    for (var i = 0; i < parts.length; i++) {
+      sock.add(utf8.encode(parts[i]));
+      await sock.flush();
+      if (i < parts.length - 1) await Future.delayed(const Duration(milliseconds: 150));
+    }
+    final head = await hdr.future.timeout(const Duration(seconds: 10));
+    final first = head.split('\r\n').first;
+    final m = RegExp(r'^HTTP/\d\.\d\s+(\d{3})').firstMatch(first);
+    final code = m == null ? 0 : int.parse(m.group(1)!);
+    log('Réponse payload : $first');
+    if (code < 100 || code > 299) {
+      sock.destroy();
+      throw 'réponse du serveur : $first';
+    }
+  }
+  return _Remote(sock, ctl.stream);
+}
+
+class _ByteReader {
+  final StreamIterator<Uint8List> it;
+  final List<int> buf = [];
+  _ByteReader(Stream<Uint8List> s) : it = StreamIterator<Uint8List>(s);
+  Future<List<int>> read(int n) async {
+    while (buf.length < n) {
+      if (!await it.moveNext()) throw StateError('fin de flux');
+      buf.addAll(it.current);
+    }
+    final out = buf.sublist(0, n);
+    buf.removeRange(0, n);
+    return out;
+  }
+}
+
+class SshTunnel {
+  ssh.SSHClient? client;
+  ServerSocket? bridge, socks;
+  Socket? remote;
+  void Function()? onClosed;
+  bool stopped = false;
+
+  Future<void> start(Map<String, String> f, void Function(String) log) async {
+    stopped = false;
+    final host = f['add'] ?? '';
+    final port = int.tryParse(f['port'] ?? '') ?? 22;
+    final user = f['user'] ?? '';
+    final pass = f['id'] ?? '';
+    final rem = await openRemote(f, log);
+    remote = rem.socket;
+    final br = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    bridge = br;
+    br.first.then((local) {
+      rem.stream.listen((d) {
+        try {
+          local.add(d);
+        } catch (_) {}
+      }, onDone: () => local.destroy(), onError: (Object _) => local.destroy(), cancelOnError: true);
+      local.listen((d) {
+        try {
+          rem.socket.add(d);
+        } catch (_) {}
+      }, onDone: () => rem.socket.destroy(), onError: (Object _) => rem.socket.destroy(), cancelOnError: true);
+    }, onError: (Object _) {});
+    final sock = await ssh.SSHSocket.connect('127.0.0.1', br.port);
+    final c = ssh.SSHClient(
+      sock,
+      username: user,
+      onPasswordRequest: () => pass,
+      keepAliveInterval: const Duration(seconds: 15),
+    );
+    client = c;
+    await c.authenticated.timeout(const Duration(seconds: 25));
+    c.done.then((_) {
+      if (!stopped) onClosed?.call();
+    }, onError: (Object _) {
+      if (!stopped) onClosed?.call();
+    });
+    final sv = await ServerSocket.bind(InternetAddress.loopbackIPv4, kSshPort);
+    socks = sv;
+    sv.listen(_handle);
+    log('SSH connecté : $user@$host:$port');
+  }
+
+  Future<void> stop() async {
+    stopped = true;
+    try {
+      client?.close();
+    } catch (_) {}
+    try {
+      await socks?.close();
+    } catch (_) {}
+    try {
+      await bridge?.close();
+    } catch (_) {}
+    try {
+      remote?.destroy();
+    } catch (_) {}
+    client = null;
+    socks = null;
+    bridge = null;
+    remote = null;
+  }
+
+  // Petit serveur SOCKS5 : chaque connexion passe par un canal du tunnel SSH.
+  Future<void> _handle(Socket c) async {
+    final rd = _ByteReader(c);
+    try {
+      final h = await rd.read(2);
+      await rd.read(h[1]);
+      c.add([5, 0]);
+      final q = await rd.read(4);
+      if (q[1] != 1) {
+        c.add([5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+        await c.close();
+        return;
+      }
+      String dest;
+      if (q[3] == 1) {
+        dest = InternetAddress.fromRawAddress(Uint8List.fromList(await rd.read(4))).address;
+      } else if (q[3] == 3) {
+        final n = (await rd.read(1))[0];
+        dest = utf8.decode(await rd.read(n), allowMalformed: true);
+      } else {
+        dest = InternetAddress.fromRawAddress(Uint8List.fromList(await rd.read(16))).address;
+      }
+      final pb = await rd.read(2);
+      final dport = (pb[0] << 8) | pb[1];
+      final cl = client;
+      if (cl == null) {
+        c.destroy();
+        return;
+      }
+      dynamic ch;
+      try {
+        ch = await cl.forwardLocal(dest, dport);
+      } catch (_) {
+        c.add([5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
+        await c.close();
+        return;
+      }
+      c.add([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+      ch.stream.listen((d) {
+        try {
+          c.add(d);
+        } catch (_) {}
+      }, onDone: () => c.destroy(), onError: (Object _) => c.destroy(), cancelOnError: true);
+      if (rd.buf.isNotEmpty) {
+        ch.sink.add(Uint8List.fromList(rd.buf));
+        rd.buf.clear();
+      }
+      while (await rd.it.moveNext()) {
+        ch.sink.add(rd.it.current);
+      }
+      await ch.sink.close();
+    } catch (_) {
+      try {
+        c.destroy();
+      } catch (_) {}
+    }
+  }
 }
 
 // ---------- Chiffrement des fichiers .otaku ----------
@@ -998,11 +1438,13 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   List<Skin> skins = [];
   Map<String, String> skinNames = {};
   bool hotspot = false;
+  SshTunnel? sshT;
+  bool sshBusy = false;
   bool preResolve = true, autoHost = true;
   bool insecureDefault = true;
 
   bool get connected => state == 'CONNECTED';
-  bool get busy => state == 'CONNECTING' || searching;
+  bool get busy => state == 'CONNECTING' || searching || sshBusy;
   List<String> get excludedApps =>
       excluded.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
 
@@ -1080,6 +1522,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       });
     }
     if (now == 'DISCONNECTED') {
+      _stopSsh();
       _save();
       _saveUsage();
       if (wantOn && autoReco && retries < 3) {
@@ -1204,6 +1647,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     if (l.startsWith('vless')) return 'VLESS';
     if (l.startsWith('vmess')) return 'VMess';
     if (l.startsWith('trojan')) return 'Trojan';
+    if (l.startsWith('ssh')) return 'SSH';
     if (l.startsWith('ss')) return 'Shadowsocks';
     return '?';
   }
@@ -1229,6 +1673,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         }
         return Parsed('${j['remarks'] ?? j['remark'] ?? 'Config JSON'}', addr, () => raw);
       }
+      if (link.startsWith('ssh://')) {
+        final f = parseLink(link);
+        if (f == null || (f['add'] ?? '').isEmpty) return null;
+        final nm = (f['remark'] ?? '').isEmpty ? f['add']! : f['remark']!;
+        return Parsed(nm, f['add']!, () => sshXrayJson());
+      }
       final v = FlutterV2ray.parseFromURL(link);
       return Parsed(v.remark, v.address, () => v.getFullConfiguration());
     } catch (_) {
@@ -1240,7 +1690,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   // téléphone, header host rempli, allowInsecure, Turbo, DNS et hotspot.
   Future<String> buildConfig(Parsed p, String link) async {
     final raw = p.full();
-    if (link.startsWith('xrayjson://')) return raw;
+    if (link.startsWith('xrayjson://') || link.startsWith('ssh://')) return raw;
     try {
       final m = jsonDecode(raw) as Map<String, dynamic>;
       final lf = parseLink(link) ?? <String, String>{};
@@ -1330,6 +1780,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   }
 
   Future<int> _delay(int i) async {
+    if (configs[i].link.startsWith('ssh://')) return _sshProbe(configs[i].link);
     final p = parse(configs[i].link);
     if (p == null) return -1;
     try {
@@ -1375,6 +1826,14 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     if (c.overLimit) return snack('Limite de données atteinte pour cette config');
     final p = parse(c.link);
     if (p == null) return snack('Config invalide');
+    if (c.link.startsWith('ssh://')) {
+      final ok = await _startSsh(c);
+      if (!ok) return;
+      if (!wantOn) {
+        await _stopSsh();
+        return;
+      }
+    }
     if (await v2ray.requestPermission()) {
       final cfgJson = await buildConfig(p, c.link);
       final apps = excludedApps;
@@ -1388,10 +1847,54 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     }
   }
 
+  String _short(Object e) {
+    final t = e.toString().replaceAll('Exception: ', '').replaceAll('\n', ' ');
+    return t.length > 110 ? t.substring(0, 110) : t;
+  }
+
+  Future<bool> _startSsh(Cfg c) async {
+    final f = parseLink(c.link);
+    if (f == null) {
+      snack('Config SSH illisible');
+      return false;
+    }
+    setState(() => sshBusy = true);
+    SshTunnel? t;
+    try {
+      await _stopSsh();
+      t = SshTunnel();
+      t.onClosed = () {
+        if (!mounted) return;
+        log('SSH : connexion fermée');
+        if (connected || busy) v2ray.stopV2Ray();
+      };
+      await t.start(f, log).timeout(const Duration(seconds: 45));
+      sshT = t;
+      return true;
+    } catch (e) {
+      log('SSH : échec : $e');
+      snack('SSH impossible : ${_short(e)}');
+      try {
+        await t?.stop();
+      } catch (_) {}
+      wantOn = false;
+      return false;
+    } finally {
+      if (mounted) setState(() => sshBusy = false);
+    }
+  }
+
+  Future<void> _stopSsh() async {
+    final t = sshT;
+    sshT = null;
+    if (t != null) await t.stop();
+  }
+
   Future<void> toggle() async {
     if (connected || busy) {
       wantOn = false;
       v2ray.stopV2Ray();
+      await _stopSsh();
       return;
     }
     wantOn = true;
@@ -1549,6 +2052,14 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   List<Cfg> _linesToCfgs(String text, bool hide) {
     final out = <Cfg>[];
     final tt = text.trim();
+    if (tt.contains('[Interface]') && tt.contains('[Peer]')) {
+      final w = wgToXray(tt);
+      if (w != null) {
+        return [
+          Cfg('${w['remarks']}', 'xrayjson://${base64Encode(utf8.encode(jsonEncode(w)))}', hide)
+        ];
+      }
+    }
     if (tt.startsWith('{')) {
       try {
         final j = jsonDecode(tt);
@@ -1690,7 +2201,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   Future<void> importDialog() async {
     final c = TextEditingController();
     final clip = (await Clipboard.getData('text/plain'))?.text ?? '';
-    if (clip.contains('://') || clip.startsWith('OTAKU') || clip.trim().startsWith('{')) {
+    if (clip.contains('://') || clip.startsWith('OTAKU') || clip.trim().startsWith('{') || clip.contains('[Interface]')) {
       c.text = clip.trim();
     }
     var hide = false;
@@ -1961,6 +2472,55 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     return b.toString();
   }
 
+  Future<int> _sshProbe(String link) async {
+    final f = parseLink(link);
+    if (f == null) return -1;
+    final sw = Stopwatch()..start();
+    try {
+      final r = await openRemote(f, log);
+      final first = await r.stream.first.timeout(const Duration(seconds: 8));
+      r.socket.destroy();
+      return utf8.decode(first, allowMalformed: true).startsWith('SSH-')
+          ? sw.elapsedMilliseconds
+          : -1;
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  Future<String> _sshReport(Cfg c) async {
+    final f = parseLink(c.link);
+    if (f == null) return 'Config SSH illisible.';
+    final mode = f['mode'] ?? 'direct';
+    final b = StringBuffer();
+    b.writeln('Protocole : SSH   Mode : $mode');
+    b.writeln('Cible : ${f['add']}:${f['port']}   Utilisateur : ${f['user']}');
+    if (mode.contains('ssl')) {
+      b.writeln('SNI : ${(f['sni'] ?? '').isEmpty ? f['add'] : f['sni']}');
+    }
+    if ((f['rproxy'] ?? '').isNotEmpty) b.writeln('Proxy distant : ${f['rproxy']}');
+    b.writeln('');
+    final sw = Stopwatch()..start();
+    try {
+      final r = await openRemote(f, log);
+      b.writeln('1. Connexion : OK (${sw.elapsedMilliseconds} ms)');
+      try {
+        final first = await r.stream.first.timeout(const Duration(seconds: 8));
+        final line = utf8.decode(first, allowMalformed: true).split('\n').first.trim();
+        b.writeln('2. Bannière : $line');
+        b.writeln(line.startsWith('SSH-')
+            ? '=> Le serveur SSH répond. Si la connexion échoue ensuite, vérifie l\'utilisateur et le mot de passe.'
+            : '=> Le serveur répond mais ce n\'est pas du SSH : payload ou port à revoir.');
+      } catch (_) {
+        b.writeln('2. Bannière : aucune réponse en 8 s');
+      }
+      r.socket.destroy();
+    } catch (e) {
+      b.writeln('1. Connexion : ECHEC (${_short(e)})');
+    }
+    return b.toString();
+  }
+
   Future<String> _diagReport(Cfg c, int i) async {
     final f = parseLink(c.link);
     if (f == null) return 'Lien non lisible.';
@@ -2033,7 +2593,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ]),
       ),
     );
-    final report = (await _diagReport(c, i)) + (await _coreReport(c)) + (await _nativeReport());
+    final report = c.link.startsWith('ssh://')
+        ? await _sshReport(c)
+        : (await _diagReport(c, i)) + (await _coreReport(c)) + (await _nativeReport());
     if (!mounted) return;
     Navigator.of(context).pop();
     showDialog(
@@ -2088,6 +2650,68 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             child: const Text('Copier (UUID masqué)'),
           ),
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer')),
+        ],
+      ),
+    );
+  }
+
+  Future<void> editJsonDialog(int i) async {
+    final c = configs[i];
+    final p = parse(c.link);
+    if (p == null) return;
+    String txt;
+    try {
+      txt = JsonEncoder.withIndent('  ').convert(jsonDecode(p.full()));
+    } catch (_) {
+      txt = p.full();
+    }
+    final t = TextEditingController(text: txt);
+    final n = TextEditingController(text: c.name);
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Modifier le JSON'),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 420,
+          child: Column(children: [
+            TextField(controller: n, decoration: const InputDecoration(labelText: 'Nom')),
+            const SizedBox(height: 8),
+            Expanded(
+              child: TextField(
+                controller: t,
+                maxLines: null,
+                expands: true,
+                textAlignVertical: TextAlignVertical.top,
+                style: const TextStyle(fontSize: 11),
+                decoration: const InputDecoration(border: OutlineInputBorder()),
+              ),
+            ),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
+          FilledButton(
+            onPressed: () {
+              try {
+                final j = jsonDecode(t.text);
+                if (j is! Map || j['outbounds'] is! List) {
+                  return snack('JSON invalide : il manque « outbounds »');
+                }
+                setState(() {
+                  c.link = 'xrayjson://${base64Encode(utf8.encode(jsonEncode(j)))}';
+                  if (n.text.trim().isNotEmpty) c.name = n.text.trim();
+                  pings.clear();
+                });
+                _save();
+                Navigator.pop(ctx);
+              } catch (_) {
+                snack('JSON invalide');
+              }
+            },
+            style: FilledButton.styleFrom(backgroundColor: kRed),
+            child: const Text('Enregistrer'),
+          ),
         ],
       ),
     );
@@ -2409,6 +3033,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           _save();
         }
       }
+    } else if (v == 'editjson') {
+      await editJsonDialog(i);
     } else if (v == 'engine') {
       await engineView(i);
     } else if (v == 'resetuse') {
@@ -2672,7 +3298,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final cs = curSkin;
     final statusText = connected
         ? (cs != null ? 'Aura activée' : 'Mangekyō activé')
-        : searching
+        : sshBusy
+            ? 'Connexion SSH...'
+            : searching
             ? 'Recherche du meilleur serveur...'
             : busy
                 ? 'Activation...'
@@ -2884,6 +3512,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                               const PopupMenuItem(value: 'diag', child: Text('Diagnostiquer')),
                             if (!c.hidden && !c.isJson)
                               const PopupMenuItem(value: 'edit', child: Text('Modifier')),
+                            if (!c.hidden && c.isJson)
+                              const PopupMenuItem(value: 'editjson', child: Text('Modifier le JSON')),
                             if (!c.hidden)
                               const PopupMenuItem(
                                   value: 'engine', child: Text('Voir la config du moteur')),
@@ -3079,7 +3709,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v6.0'),
+          title: Text('OTAKU TUNNEL v6.1'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
