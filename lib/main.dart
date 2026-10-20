@@ -45,8 +45,14 @@ class Cfg {
   int limitMb;
   int used;
   String sub;
+  String msg, cmsg;
   Cfg(this.name, this.link, this.hidden,
-      {this.expiry = '', this.limitMb = 0, this.used = 0, this.sub = ''});
+      {this.expiry = '',
+      this.limitMb = 0,
+      this.used = 0,
+      this.sub = '',
+      this.msg = '',
+      this.cmsg = ''});
 
   Map<String, dynamic> toJson() => {
         'name': name,
@@ -54,6 +60,8 @@ class Cfg {
         'hidden': hidden,
         'expiry': expiry,
         'limitMb': limitMb,
+        'msg': msg,
+        'cmsg': cmsg,
       };
   Map<String, dynamic> toStore() => {...toJson(), 'used': used, 'sub': sub};
 
@@ -65,6 +73,8 @@ class Cfg {
         limitMb: num.tryParse('${j['limitMb'] ?? 0}')?.toInt() ?? 0,
         used: num.tryParse('${j['used'] ?? 0}')?.toInt() ?? 0,
         sub: (j['sub'] ?? '').toString(),
+        msg: (j['msg'] ?? '').toString(),
+        cmsg: (j['cmsg'] ?? '').toString(),
       );
 
   bool get expired {
@@ -730,7 +740,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
 
   static const keys = [
     'remark', 'add', 'port', 'id', 'aid', 'scn', 'host', 'path', 'sni', 'alpn', 'fp',
-    'flow', 'enc', 'svc', 'method', 'expiry', 'limit', 'user', 'payload', 'rproxy'
+    'flow', 'enc', 'svc', 'method', 'expiry', 'limit', 'user', 'payload', 'rproxy', 'msg', 'cmsg'
   ];
 
   @override
@@ -756,6 +766,8 @@ class _ConfigEditorState extends State<ConfigEditor> {
       insecure = ir.isEmpty ? widget.defaultInsecure : (ir == '1' || ir.toLowerCase() == 'true');
       c['expiry']!.text = cf.expiry;
       c['limit']!.text = cf.limitMb > 0 ? '${cf.limitMb}' : '';
+      c['msg']!.text = cf.msg;
+      c['cmsg']!.text = cf.cmsg;
     } else {
       proto = 'vmess';
       _defaults();
@@ -815,7 +827,9 @@ class _ConfigEditorState extends State<ConfigEditor> {
           expiry: ex,
           limitMb: int.tryParse(c['limit']!.text.trim()) ?? 0,
           used: old?.used ?? 0,
-          sub: old?.sub ?? ''),
+          sub: old?.sub ?? '',
+          msg: c['msg']!.text.trim(),
+          cmsg: c['cmsg']!.text.trim()),
     );
   }
 
@@ -940,6 +954,16 @@ class _ConfigEditorState extends State<ConfigEditor> {
           const Divider(),
           field('expiry', 'Expire le (AAAA-MM-JJ, facultatif)'),
           field('limit', 'Limite de données en Mo (0 = aucune)', type: TextInputType.number),
+          const Divider(),
+          const Text('Messages (facultatif)', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          const Text(
+              'HTML simple (<b>, <i>, <u>, <h1>, <br>, <center>, <span style="color:#ff0">) et '
+              'variables {ip} {pays} {ville} {heure} {serveur}. Le code Python n\'est jamais exécuté.',
+              style: TextStyle(color: Colors.white60, fontSize: 11)),
+          const SizedBox(height: 8),
+          field('msg', 'Message pour celui qui ouvre le fichier', lines: 4),
+          field('cmsg', 'Message de connexion (quand le trafic passe)', lines: 4),
           const SizedBox(height: 8),
           FilledButton(
             onPressed: _save,
@@ -1303,6 +1327,279 @@ class SshTunnel {
   }
 }
 
+// ---------- Messages : HTML simple + variables (aucun script n'est jamais exécuté) ----------
+class IpInfo {
+  final String ip, country, cc, city, region, isp, tz;
+  final DateTime at;
+  IpInfo(this.ip, this.country, this.cc, this.city, this.region, this.isp, this.tz, this.at);
+}
+
+String flagOf(String cc) => cc.length == 2
+    ? String.fromCharCodes(cc.toUpperCase().codeUnits.map((c) => 0x1F1E6 + c - 65))
+    : '🌐';
+
+const kSteps = ['Config', 'Tunnel SSH', 'Moteur', 'Trafic', 'IP / lieu'];
+
+String fillVars(String s, Map<String, String> v) {
+  var out = s;
+  v.forEach((k, val) => out = out.replaceAll('{$k}', val));
+  return out;
+}
+
+String decodeEntities(String s) => s
+    .replaceAll('&nbsp;', ' ')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replaceAllMapped(RegExp(r'&#(\d+);'), (m) => String.fromCharCode(int.parse(m.group(1)!)))
+    .replaceAll('&amp;', '&');
+
+Color? parseCssColor(String raw) {
+  final v = raw.trim().toLowerCase();
+  const names = <String, int>{
+    'red': 0xFFFF0000, 'green': 0xFF008000, 'lime': 0xFF00FF00, 'blue': 0xFF0000FF,
+    'yellow': 0xFFFFFF00, 'orange': 0xFFFFA500, 'purple': 0xFF800080, 'pink': 0xFFFFC0CB,
+    'white': 0xFFFFFFFF, 'black': 0xFF000000, 'gray': 0xFF808080, 'grey': 0xFF808080,
+    'cyan': 0xFF00FFFF, 'aqua': 0xFF00FFFF, 'magenta': 0xFFFF00FF, 'fuchsia': 0xFFFF00FF,
+    'gold': 0xFFFFD700, 'silver': 0xFFC0C0C0, 'brown': 0xFFA52A2A, 'violet': 0xFFEE82EE,
+    'indigo': 0xFF4B0082, 'teal': 0xFF008080, 'navy': 0xFF000080, 'crimson': 0xFFDC143C,
+  };
+  if (names.containsKey(v)) return Color(names[v]!);
+  if (v.startsWith('#')) {
+    var h = v.substring(1);
+    if (h.length == 3) h = h.split('').map((e) => '$e$e').join();
+    if (h.length == 6) {
+      final n = int.tryParse(h, radix: 16);
+      if (n != null) return Color(0xFF000000 | n);
+    }
+  }
+  final m = RegExp(r'rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)').firstMatch(v);
+  if (m != null) {
+    return Color.fromARGB(255, int.parse(m.group(1)!).clamp(0, 255),
+        int.parse(m.group(2)!).clamp(0, 255), int.parse(m.group(3)!).clamp(0, 255));
+  }
+  return null;
+}
+
+class _Sty {
+  Color? color, bg;
+  double size;
+  bool b, i, u, s, mono;
+  TextAlign? align;
+  _Sty(this.size,
+      {this.color,
+      this.bg,
+      this.b = false,
+      this.i = false,
+      this.u = false,
+      this.s = false,
+      this.mono = false,
+      this.align});
+  _Sty copy() =>
+      _Sty(size, color: color, bg: bg, b: b, i: i, u: u, s: s, mono: mono, align: align);
+}
+
+String? _attr(String attrs, String name) {
+  final m = RegExp('$name\\s*=\\s*"([^"]*)"', caseSensitive: false).firstMatch(attrs) ??
+      RegExp("$name\\s*=\\s*'([^']*)'", caseSensitive: false).firstMatch(attrs) ??
+      RegExp('$name\\s*=\\s*([^\\s>"\']+)', caseSensitive: false).firstMatch(attrs);
+  return m?.group(1);
+}
+
+void _css(_Sty s, String css, double base) {
+  for (final m in RegExp(r'([a-zA-Z-]+)\s*:\s*([^;]+)').allMatches(css)) {
+    final k = m.group(1)!.toLowerCase();
+    final v = m.group(2)!.trim().toLowerCase();
+    if (k == 'color') {
+      s.color = parseCssColor(v) ?? s.color;
+    } else if (k == 'background' || k == 'background-color') {
+      s.bg = parseCssColor(v) ?? s.bg;
+    } else if (k == 'font-size') {
+      final n = double.tryParse(RegExp(r'[\d.]+').firstMatch(v)?.group(0) ?? '');
+      if (n != null) {
+        if (v.contains('em')) {
+          s.size = base * n;
+        } else if (v.contains('%')) {
+          s.size = base * n / 100;
+        } else if (v.contains('pt')) {
+          s.size = n * 1.33;
+        } else {
+          s.size = n;
+        }
+        s.size = s.size.clamp(8.0, 48.0);
+      }
+    } else if (k == 'font-weight') {
+      s.b = v.contains('bold') || (int.tryParse(v) ?? 0) >= 600;
+    } else if (k == 'font-style') {
+      s.i = v.contains('italic');
+    } else if (k == 'text-decoration') {
+      if (v.contains('underline')) s.u = true;
+      if (v.contains('line-through')) s.s = true;
+    } else if (k == 'text-align') {
+      s.align = v.contains('center')
+          ? TextAlign.center
+          : (v.contains('right') ? TextAlign.right : TextAlign.left);
+    }
+  }
+}
+
+TextStyle _ts(_Sty s) => TextStyle(
+      color: s.color ?? Colors.white,
+      fontSize: s.size,
+      fontWeight: s.b ? FontWeight.bold : FontWeight.normal,
+      fontStyle: s.i ? FontStyle.italic : FontStyle.normal,
+      backgroundColor: s.bg,
+      fontFamily: s.mono ? 'monospace' : null,
+      decoration: TextDecoration.combine([
+        if (s.u) TextDecoration.underline,
+        if (s.s) TextDecoration.lineThrough,
+      ]),
+    );
+
+// Affiche un message : texte simple ou HTML limité (sans script, sans image, sans lien).
+Widget richMessage(String input, {double base = 14}) {
+  final src = input.length > 4000 ? input.substring(0, 4000) : input;
+  final cleaned = src
+      .replaceAll(RegExp(r'<!--[\s\S]*?-->'), '')
+      .replaceAll(
+          RegExp(r'<(script|style|iframe|object|embed)[\s\S]*?</\1\s*>', caseSensitive: false), '');
+  if (!RegExp(r'<[a-zA-Z/]').hasMatch(cleaned)) {
+    return Text(decodeEntities(cleaned), style: TextStyle(color: Colors.white, fontSize: base));
+  }
+  try {
+    const blockTags = {'p', 'div', 'h1', 'h2', 'h3', 'h4', 'li', 'ul', 'ol', 'center', 'pre', 'blockquote'};
+    final blocks = <Widget>[];
+    var spans = <InlineSpan>[];
+    var align = TextAlign.start;
+    final stack = <_Sty>[_Sty(base, color: Colors.white)];
+    final tags = <String>['#root'];
+    void flush() {
+      if (spans.isEmpty) return;
+      blocks.add(Padding(
+        padding: const EdgeInsets.only(bottom: 6),
+        child: SizedBox(
+            width: double.infinity,
+            child: Text.rich(TextSpan(children: spans), textAlign: align)),
+      ));
+      spans = <InlineSpan>[];
+    }
+
+    for (final m in RegExp(r'<[^>]*>|[^<]+').allMatches(cleaned)) {
+      final tok = m.group(0)!;
+      if (!tok.startsWith('<')) {
+        final t = decodeEntities(tok.replaceAll(RegExp(r'\s+'), ' '));
+        if (t.trim().isEmpty && spans.isEmpty) continue;
+        spans.add(TextSpan(text: t, style: _ts(stack.last)));
+        continue;
+      }
+      final tm = RegExp(r'^<\s*(/?)\s*([a-zA-Z0-9]+)([^>]*)>$').firstMatch(tok);
+      if (tm == null) continue;
+      final closing = tm.group(1) == '/';
+      final tag = tm.group(2)!.toLowerCase();
+      final attrs = tm.group(3) ?? '';
+      if (tag == 'br') {
+        spans.add(const TextSpan(text: '\n'));
+        continue;
+      }
+      if (tag == 'hr') {
+        flush();
+        blocks.add(const Divider(color: Colors.white24));
+        continue;
+      }
+      if (!closing) {
+        final st = stack.last.copy();
+        switch (tag) {
+          case 'b':
+          case 'strong':
+            st.b = true;
+            break;
+          case 'i':
+          case 'em':
+            st.i = true;
+            break;
+          case 'u':
+            st.u = true;
+            break;
+          case 's':
+          case 'strike':
+          case 'del':
+            st.s = true;
+            break;
+          case 'small':
+            st.size = st.size * 0.85;
+            break;
+          case 'big':
+            st.size = st.size * 1.2;
+            break;
+          case 'code':
+          case 'pre':
+          case 'tt':
+            st.mono = true;
+            break;
+          case 'h1':
+            st.size = base * 1.8;
+            st.b = true;
+            break;
+          case 'h2':
+            st.size = base * 1.5;
+            st.b = true;
+            break;
+          case 'h3':
+            st.size = base * 1.25;
+            st.b = true;
+            break;
+          case 'h4':
+            st.size = base * 1.1;
+            st.b = true;
+            break;
+          case 'center':
+            st.align = TextAlign.center;
+            break;
+          case 'font':
+            final c = _attr(attrs, 'color');
+            if (c != null) st.color = parseCssColor(c) ?? st.color;
+            final sz = int.tryParse(_attr(attrs, 'size') ?? '');
+            if (sz != null) st.size = base * (0.7 + 0.15 * sz.clamp(1, 7));
+            break;
+        }
+        final css = _attr(attrs, 'style');
+        if (css != null) _css(st, css, base);
+        final al = _attr(attrs, 'align');
+        if (al != null) {
+          st.align = al.contains('center')
+              ? TextAlign.center
+              : (al.contains('right') ? TextAlign.right : st.align);
+        }
+        if (blockTags.contains(tag)) {
+          flush();
+          if (tag == 'li') spans.add(TextSpan(text: '• ', style: _ts(st)));
+        }
+        stack.add(st);
+        tags.add(tag);
+        if (blockTags.contains(tag)) align = st.align ?? TextAlign.start;
+      } else {
+        final idx = tags.lastIndexOf(tag);
+        if (idx > 0) {
+          while (tags.length > idx) {
+            tags.removeLast();
+            stack.removeLast();
+          }
+        }
+        if (blockTags.contains(tag)) {
+          flush();
+          align = stack.last.align ?? TextAlign.start;
+        }
+      }
+    }
+    flush();
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: blocks);
+  } catch (_) {
+    return Text(decodeEntities(cleaned.replaceAll(RegExp(r'<[^>]*>'), '')),
+        style: TextStyle(color: Colors.white, fontSize: base));
+  }
+}
+
 // ---------- Chiffrement des fichiers .otaku ----------
 cr.Pbkdf2 _kdf() =>
     cr.Pbkdf2(macAlgorithm: cr.Hmac.sha256(), iterations: 50000, bits: 256);
@@ -1421,6 +1718,11 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   int sel = 0;
   final Map<int, int> pings = {};
   final List<String> logs = [];
+  final ValueNotifier<int> logTick = ValueNotifier<int>(0);
+  Timer? _ipTimer;
+  IpInfo? ipNow, ipDirect;
+  bool ipLoading = false, trafficOk = false;
+  List<int> stepSt = List<int>.filled(5, 0);
   final List<double> hist = [];
   final Map<String, int> usage = {};
   List<Map<String, dynamic>> subs = [];
@@ -1485,11 +1787,17 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       if (call.method == 'onIntent') _incoming('${call.arguments}');
       return null;
     });
+    _ipTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+      if (mounted && tab == 2 && !ipLoading) refreshIp();
+    });
     _load();
   }
 
-  void log(String m) =>
-      logs.add('${DateTime.now().toIso8601String().substring(11, 19)}  $m');
+  void log(String m) {
+    logs.add('${DateTime.now().toIso8601String().substring(11, 19)}  $m');
+    if (logs.length > 400) logs.removeRange(0, logs.length - 400);
+    logTick.value++;
+  }
 
   String _today() => DateTime.now().toIso8601String().substring(0, 10);
 
@@ -1513,8 +1821,11 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   }
 
   void _onState(String now) {
+    if (now == 'CONNECTING') setStep(2, 1);
     if (now == 'CONNECTED') {
       retries = 0;
+      setStep(2, 2);
+      _afterConnected();
       Future.delayed(const Duration(seconds: 12), () {
         if (mounted && connected && dlTotal + upTotal == 0) {
           snack('Connecté mais aucun trafic détecté. Touche Diagnostic complet.');
@@ -1522,6 +1833,14 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       });
     }
     if (now == 'DISCONNECTED') {
+      trafficOk = false;
+      if (stepSt[2] != 3) {
+        stepSt = List<int>.filled(kSteps.length, 0);
+        logTick.value++;
+      }
+      Future.delayed(const Duration(seconds: 3), () {
+        if (mounted && !connected) refreshIp(force: true);
+      });
       _stopSsh();
       _save();
       _saveUsage();
@@ -1587,6 +1906,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       insecureDefault = p.getBool('insecureDefault') ?? true;
     });
     await _loadSkins(p);
+    refreshIp();
     try {
       final t = await kChan.invokeMethod<String>('getInitial');
       if (t != null && t.isNotEmpty) await _incoming(t);
@@ -1822,18 +2142,29 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     if (configs.isEmpty) return snack('Ajoute d\'abord une config (onglet Configs)');
     if (autoBest && !skipBest && configs.length > 1) await bestServer();
     final c = configs[sel];
+    _resetSteps();
+    log('--- Connexion : ${c.name} (${proto(c.link)}) ---');
     if (c.expired) return snack('Cette config est expirée');
     if (c.overLimit) return snack('Limite de données atteinte pour cette config');
     final p = parse(c.link);
-    if (p == null) return snack('Config invalide');
+    if (p == null) {
+      setStep(0, 3);
+      return snack('Config invalide');
+    }
+    setStep(0, 2);
+    log('Config lue : ${p.address}');
+    setStep(1, c.link.startsWith('ssh://') ? 1 : 4);
     if (c.link.startsWith('ssh://')) {
       final ok = await _startSsh(c);
+      setStep(1, ok ? 2 : 3);
       if (!ok) return;
       if (!wantOn) {
         await _stopSsh();
         return;
       }
     }
+    setStep(2, 1);
+    log('Demande d\'autorisation VPN');
     if (await v2ray.requestPermission()) {
       final cfgJson = await buildConfig(p, c.link);
       final apps = excludedApps;
@@ -2185,6 +2516,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     _save();
     log('Import : ${l.length} config(s)');
     snack('${l.length} config(s) ajoutée(s)');
+    for (final c in l) {
+      if (c.msg.trim().isNotEmpty) {
+        showMsgDialog('Message du créateur', c.msg);
+        break;
+      }
+    }
   }
 
   Future<void> importFile(bool hide) async {
@@ -3033,6 +3370,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           _save();
         }
       }
+    } else if (v == 'messages') {
+      await messagesDialog(i);
     } else if (v == 'editjson') {
       await editJsonDialog(i);
     } else if (v == 'engine') {
@@ -3048,7 +3387,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     } else if (v == 'share') {
       await shareFile([c], c.name);
     } else if (v == 'sharelock') {
-      await shareFile([Cfg(c.name, c.link, true, expiry: c.expiry, limitMb: c.limitMb)], c.name);
+      await shareFile([Cfg(c.name, c.link, true, expiry: c.expiry, limitMb: c.limitMb, msg: c.msg, cmsg: c.cmsg)], c.name);
     } else if (v == 'del') {
       setState(() {
         configs.removeAt(i);
@@ -3292,6 +3631,365 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         },
       );
 
+  @override
+  void dispose() {
+    _ipTimer?.cancel();
+    spin.dispose();
+    super.dispose();
+  }
+
+  void setStep(int i, int st) {
+    stepSt[i] = st;
+    logTick.value++;
+  }
+
+  void _resetSteps() {
+    stepSt = List<int>.filled(kSteps.length, 0);
+    trafficOk = false;
+    logTick.value++;
+  }
+
+  Map<String, String> msgVars() {
+    final i = ipNow;
+    final now = DateTime.now();
+    String two(int n) => n.toString().padLeft(2, '0');
+    return {
+      'ip': i?.ip ?? '—',
+      'pays': i?.country ?? '—',
+      'ville': i?.city ?? '—',
+      'region': i?.region ?? '—',
+      'fai': i?.isp ?? '—',
+      'fuseau': i?.tz ?? '—',
+      'heure': '${two(now.hour)}:${two(now.minute)}:${two(now.second)}',
+      'date': '${two(now.day)}/${two(now.month)}/${now.year}',
+      'serveur': configs.isEmpty ? '' : configs[sel].name,
+      'duree': duration,
+    };
+  }
+
+  void showMsgDialog(String title, String html) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: SingleChildScrollView(child: richMessage(fillVars(html, msgVars()))),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+      ),
+    );
+  }
+
+  Future<void> messagesDialog(int i) async {
+    final c = configs[i];
+    final m = TextEditingController(text: c.msg);
+    final cm = TextEditingController(text: c.cmsg);
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Messages du fichier'),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 440,
+          child: SingleChildScrollView(
+            child: Column(children: [
+              const Text(
+                  'HTML simple (<b>, <i>, <u>, <h1>, <br>, <center>, <span style="color:#ff0">) '
+                  'et variables {ip} {pays} {ville} {heure} {serveur}. '
+                  'Le code Python n\'est jamais exécuté.',
+                  style: TextStyle(color: Colors.white60, fontSize: 11)),
+              const SizedBox(height: 8),
+              TextField(
+                controller: m,
+                maxLines: 5,
+                decoration: const InputDecoration(
+                    labelText: 'Message pour celui qui ouvre le fichier',
+                    border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: cm,
+                maxLines: 5,
+                decoration: const InputDecoration(
+                    labelText: 'Message de connexion (quand le trafic passe)',
+                    border: OutlineInputBorder()),
+              ),
+            ]),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => showMsgDialog('Aperçu du message', m.text), child: const Text('Aperçu 1')),
+          TextButton(onPressed: () => showMsgDialog('Aperçu du message de connexion', cm.text), child: const Text('Aperçu 2')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
+          FilledButton(
+            onPressed: () {
+              setState(() {
+                c.msg = m.text.trim();
+                c.cmsg = cm.text.trim();
+              });
+              _save();
+              Navigator.pop(ctx);
+            },
+            style: FilledButton.styleFrom(backgroundColor: kRed),
+            child: const Text('Enregistrer'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ----- Adresse IP et localisation (service en ligne, via le VPN quand il est actif) -----
+  Future<IpInfo?> _lookupIp() async {
+    const urls = [
+      'https://ipwho.is/',
+      'https://ipapi.co/json/',
+      'http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,query,timezone',
+    ];
+    for (final u in urls) {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 7);
+      try {
+        final req = await client.getUrl(Uri.parse(u)).timeout(const Duration(seconds: 7));
+        req.headers.set('User-Agent', 'OtakuTunnel');
+        final res = await req.close().timeout(const Duration(seconds: 7));
+        if (res.statusCode != 200) continue;
+        final body = await res.transform(utf8.decoder).join().timeout(const Duration(seconds: 7));
+        final j = jsonDecode(body) as Map<String, dynamic>;
+        final ip = '${j['ip'] ?? j['query'] ?? ''}';
+        if (ip.isEmpty) continue;
+        String s(dynamic v) => v == null ? '' : '$v';
+        final conn = j['connection'];
+        final tzv = j['timezone'];
+        return IpInfo(
+          ip,
+          s(j['country_name'] ?? j['country']),
+          s(j['country_code'] ?? j['countryCode']),
+          s(j['city']),
+          s(j['region'] ?? j['regionName']),
+          s(conn is Map ? conn['isp'] : (j['isp'] ?? j['org'])),
+          s(tzv is Map ? tzv['id'] : tzv),
+          DateTime.now(),
+        );
+      } catch (_) {
+      } finally {
+        client.close(force: true);
+      }
+    }
+    return null;
+  }
+
+  Future<IpInfo?> refreshIp({bool force = false}) async {
+    if (ipLoading && !force) return ipNow;
+    if (mounted) setState(() => ipLoading = true);
+    final r = await _lookupIp();
+    if (!mounted) return r;
+    setState(() {
+      ipLoading = false;
+      if (r != null) {
+        ipNow = r;
+        if (!connected) ipDirect = r;
+      }
+    });
+    if (r != null) {
+      log('IP : ${r.ip} (${r.city.isEmpty ? '' : '${r.city}, '}${r.country})');
+    } else {
+      log('IP : recherche impossible (pas de trafic ?)');
+    }
+    return r;
+  }
+
+  // Après « Connecté » : on vérifie que le trafic passe vraiment (recherche d'IP à travers le tunnel).
+  Future<void> _afterConnected() async {
+    setStep(3, 1);
+    for (var k = 0; k < 4 && connected; k++) {
+      await Future.delayed(Duration(seconds: k == 0 ? 3 : 6));
+      if (!mounted || !connected) return;
+      final r = await refreshIp(force: true);
+      if (r != null) {
+        trafficOk = true;
+        setStep(3, 2);
+        setStep(4, 2);
+        log('Trafic OK : IP ${r.ip} (${r.country})');
+        if (mounted) {
+          final c = configs.isEmpty ? null : configs[sel];
+          if (c != null && c.cmsg.trim().isNotEmpty) {
+            snack('Message de connexion reçu : voir l\'onglet Journal');
+          }
+          setState(() {});
+        }
+        return;
+      }
+      log('Pas encore de trafic (essai ${k + 1}/4)');
+    }
+    if (mounted && connected) {
+      setStep(3, 3);
+      log('Aucun trafic détecté : touche Diagnostic complet');
+    }
+  }
+
+  // ----- Onglet Journal -----
+  Widget journalCard(String title, IconData ic, List<Widget> ch) => Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(16)),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(ic, size: 18, color: kRed),
+            const SizedBox(width: 8),
+            Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+          ]),
+          const SizedBox(height: 10),
+          ...ch,
+        ]),
+      );
+
+  Widget stepChip(int k) {
+    final st = stepSt[k];
+    Widget icon;
+    if (st == 1) {
+      icon = const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2));
+    } else if (st == 2) {
+      icon = const Icon(Icons.check_circle, size: 16, color: Colors.greenAccent);
+    } else if (st == 3) {
+      icon = const Icon(Icons.cancel, size: 16, color: Colors.redAccent);
+    } else if (st == 4) {
+      icon = const Icon(Icons.remove, size: 16, color: Colors.white38);
+    } else {
+      icon = const Icon(Icons.radio_button_unchecked, size: 16, color: Colors.white38);
+    }
+    return Chip(avatar: icon, label: Text(kSteps[k], style: const TextStyle(fontSize: 12)));
+  }
+
+  Color logColor(String l) {
+    final x = l.toLowerCase();
+    if (x.contains('échec') || x.contains('echec') || x.contains('impossible') || x.contains('aucun trafic') || x.contains('refus')) {
+      return Colors.redAccent;
+    }
+    if (x.contains('connected') || x.contains('trafic ok') || x.contains('connecté') || x.contains('résolu')) {
+      return Colors.greenAccent;
+    }
+    return Colors.white70;
+  }
+
+  Widget journalTab() {
+    final c = configs.isEmpty ? null : configs[sel];
+    final ip = ipNow;
+    final vars = msgVars();
+    final small = const TextStyle(color: Colors.white54, fontSize: 12);
+    String two(int n) => n.toString().padLeft(2, '0');
+    return ListView(padding: const EdgeInsets.all(16), children: [
+      Row(children: [
+        const Text('Journal', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+        const Spacer(),
+        IconButton(
+          tooltip: 'Actualiser',
+          onPressed: ipLoading ? null : () => refreshIp(),
+          icon: ipLoading
+              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+              : const Icon(Icons.refresh),
+        ),
+      ]),
+      const SizedBox(height: 8),
+      journalCard('Mon IP et ma position', Icons.public, [
+        if (ip == null)
+          Text(ipLoading ? 'Recherche de ton adresse IP...' : 'Adresse IP inconnue. Touche actualiser.',
+              style: small)
+        else ...[
+          Row(children: [
+            Text(flagOf(ip.cc), style: const TextStyle(fontSize: 28)),
+            const SizedBox(width: 10),
+            Expanded(
+                child: SelectableText(ip.ip,
+                    style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold))),
+          ]),
+          const SizedBox(height: 6),
+          Text('${ip.city.isEmpty ? '' : '${ip.city}, '}${ip.region.isEmpty ? '' : '${ip.region}, '}${ip.country}'),
+          if (ip.isp.isNotEmpty) Text('Opérateur : ${ip.isp}', style: small),
+          if (ip.tz.isNotEmpty) Text('Fuseau : ${ip.tz}', style: small),
+          Text(
+              'Mis à jour à ${two(ip.at.hour)}:${two(ip.at.minute)}:${two(ip.at.second)} • '
+              '${connected ? 'via le VPN' : 'connexion directe'}',
+              style: small),
+          if (connected && ipDirect != null && ipDirect!.ip != ip.ip)
+            Text('IP avant le VPN : ${ipDirect!.ip} (${ipDirect!.country})', style: small),
+        ],
+        const SizedBox(height: 8),
+        Text('Position approximative d\'après l\'adresse IP, donnée par un service en ligne.',
+            style: small),
+      ]),
+      journalCard('Connexion en direct', Icons.timeline, [
+        ValueListenableBuilder<int>(
+          valueListenable: logTick,
+          builder: (_, __, ___) => Wrap(
+              spacing: 8, runSpacing: 6, children: [for (var k = 0; k < kSteps.length; k++) stepChip(k)]),
+        ),
+      ]),
+      journalCard('Messages', Icons.mail_outline, [
+        if (c == null)
+          Text('Ajoute une config pour voir ses messages.', style: small)
+        else ...[
+          const Text('Message du créateur', style: TextStyle(color: kRed, fontSize: 12)),
+          const SizedBox(height: 4),
+          if (c.msg.trim().isEmpty)
+            Text('Aucun message pour cette config.', style: small)
+          else
+            richMessage(fillVars(c.msg, vars)),
+          const SizedBox(height: 12),
+          const Text('Message de connexion', style: TextStyle(color: kRed, fontSize: 12)),
+          const SizedBox(height: 4),
+          if (c.cmsg.trim().isEmpty)
+            Text('Aucun message de connexion.', style: small)
+          else if (!trafficOk)
+            Text('Il s\'affichera quand le trafic passera.', style: small)
+          else
+            richMessage(fillVars(c.cmsg, vars)),
+        ],
+      ]),
+      journalCard('Journal en direct', Icons.article_outlined, [
+        Wrap(spacing: 6, children: [
+          TextButton.icon(
+            onPressed: () {
+              if (configs.isEmpty) return snack('Ajoute d\'abord une config');
+              diagnose(configs[sel], sel);
+            },
+            icon: const Icon(Icons.troubleshoot, size: 18),
+            label: const Text('Diagnostic'),
+          ),
+          TextButton.icon(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: logs.join('\n')));
+              snack('Journal copié');
+            },
+            icon: const Icon(Icons.copy, size: 18),
+            label: const Text('Copier'),
+          ),
+          TextButton.icon(
+            onPressed: () {
+              logs.clear();
+              logTick.value++;
+            },
+            icon: const Icon(Icons.delete_outline, size: 18),
+            label: const Text('Effacer'),
+          ),
+        ]),
+        ValueListenableBuilder<int>(
+          valueListenable: logTick,
+          builder: (_, __, ___) {
+            final shown = logs.reversed.take(80).toList();
+            if (shown.isEmpty) return Text('Aucun événement pour le moment.', style: small);
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final l in shown)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Text(l, style: TextStyle(fontSize: 11.5, color: logColor(l))),
+                  ),
+              ],
+            );
+          },
+        ),
+      ]),
+    ]);
+  }
+
   Widget connectionTab() {
     final c = configs.isEmpty ? null : configs[sel];
     final p = c == null ? null : parse(c.link);
@@ -3515,6 +4213,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                             if (!c.hidden && c.isJson)
                               const PopupMenuItem(value: 'editjson', child: Text('Modifier le JSON')),
                             if (!c.hidden)
+                              const PopupMenuItem(value: 'messages', child: Text('Messages')),
+                            if (!c.hidden)
                               const PopupMenuItem(
                                   value: 'engine', child: Text('Voir la config du moteur')),
                             if (c.limitMb > 0)
@@ -3709,7 +4409,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v6.1'),
+          title: Text('OTAKU TUNNEL v6.2'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
@@ -3720,16 +4420,20 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           child: Center(
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 560),
-              child: [connectionTab(), configsTab(), settingsTab()][tab],
+              child: [connectionTab(), configsTab(), journalTab(), settingsTab()][tab],
             ),
           ),
         ),
         bottomNavigationBar: NavigationBar(
           selectedIndex: tab,
-          onDestinationSelected: (i) => setState(() => tab = i),
+          onDestinationSelected: (i) {
+            setState(() => tab = i);
+            if (i == 2 && !ipLoading) refreshIp();
+          },
           destinations: const [
             NavigationDestination(icon: Icon(Icons.shield_outlined), label: 'Connexion'),
             NavigationDestination(icon: Icon(Icons.public), label: 'Configs'),
+            NavigationDestination(icon: Icon(Icons.receipt_long), label: 'Journal'),
             NavigationDestination(icon: Icon(Icons.settings), label: 'Réglages'),
           ],
         ),
