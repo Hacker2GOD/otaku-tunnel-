@@ -1,9 +1,11 @@
+import 'package:flutter/gestures.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:url_launcher/url_launcher.dart';
 import 'package:dartssh2/dartssh2.dart' as ssh;
 import 'package:cryptography/cryptography.dart' as cr;
 import 'package:file_selector/file_selector.dart';
@@ -560,6 +562,24 @@ Map<String, String>? parseLink(String link) {
       });
       return f;
     }
+    if (l.startsWith('dns://')) {
+      final j = jsonDecode(utf8.decode(b64dec(l.substring(6)))) as Map<String, dynamic>;
+      return {
+        'proto': 'dns',
+        'remark': '${j['n'] ?? ''}',
+        'add': '',
+        'domain': '${j['d'] ?? ''}',
+        'pubkey': '${j['pk'] ?? ''}',
+        'transport': '${j['tr'] ?? 'udp'}',
+        'resolver': '${j['rs'] ?? '8.8.8.8:53'}',
+        'smethod': '${j['m'] ?? 'ssh'}',
+        'suser': '${j['su'] ?? ''}',
+        'spass': '${j['sp'] ?? ''}',
+        'user': '${j['u'] ?? ''}',
+        'id': '${j['p'] ?? ''}',
+        'port': '${j['port'] ?? 22}',
+      };
+    }
     if (l.startsWith('ssh://')) {
       final body = l.substring(6);
       try {
@@ -642,7 +662,7 @@ String? buildLink(Map<String, String> f) {
   final p = f['proto'] ?? '';
   final remark = f['remark'] ?? '';
   final port = int.tryParse(f['port'] ?? '') ?? 443;
-  if ((f['add'] ?? '').isEmpty) return null;
+  if (p != 'dns' && (f['add'] ?? '').isEmpty) return null;
   if (p == 'vmess') {
     final j = {
       'v': '2',
@@ -696,6 +716,22 @@ String? buildLink(Map<String, String> f) {
       fragment: remark.isEmpty ? null : remark,
     ).toString();
   }
+  if (p == 'dns') {
+    final j = {
+      'n': remark,
+      'd': f['domain'] ?? '',
+      'pk': f['pubkey'] ?? '',
+      'tr': f['transport'] ?? 'udp',
+      'rs': f['resolver'] ?? '',
+      'm': f['smethod'] ?? 'ssh',
+      'su': f['suser'] ?? '',
+      'sp': f['spass'] ?? '',
+      'u': f['user'] ?? '',
+      'p': f['id'] ?? '',
+      'port': (f['port'] ?? '').isEmpty ? 22 : port,
+    };
+    return 'dns://${base64Encode(utf8.encode(jsonEncode(j)))}';
+  }
   if (p == 'ssh') {
     final j = {
       'n': remark,
@@ -733,6 +769,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
   late String proto;
   String net = 'ws', tls = 'tls', vtype = 'none';
   String smode = 'direct';
+  String dtrans = 'udp', dmethod = 'ssh';
   bool insecure = false;
   final Map<String, TextEditingController> c = {};
   final Map<String, String> extra = {};
@@ -740,7 +777,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
 
   static const keys = [
     'remark', 'add', 'port', 'id', 'aid', 'scn', 'host', 'path', 'sni', 'alpn', 'fp',
-    'flow', 'enc', 'svc', 'method', 'expiry', 'limit', 'user', 'payload', 'rproxy', 'msg', 'cmsg'
+    'flow', 'enc', 'svc', 'method', 'expiry', 'limit', 'user', 'payload', 'rproxy', 'msg', 'cmsg', 'domain', 'pubkey', 'resolver', 'suser', 'spass'
   ];
 
   @override
@@ -762,6 +799,8 @@ class _ConfigEditorState extends State<ConfigEditor> {
       tls = f['tls'] ?? '';
       vtype = f['type'] ?? 'none';
       smode = f['mode'] ?? 'direct';
+      dtrans = f['transport'] ?? 'udp';
+      dmethod = f['smethod'] ?? 'ssh';
       final ir = f['ins'] ?? '';
       insecure = ir.isEmpty ? widget.defaultInsecure : (ir == '1' || ir.toLowerCase() == 'true');
       c['expiry']!.text = cf.expiry;
@@ -783,6 +822,12 @@ class _ConfigEditorState extends State<ConfigEditor> {
     net = 'ws';
     tls = 'tls';
     insecure = widget.defaultInsecure;
+    if (proto == 'dns') {
+      c['port']!.text = '22';
+      c['resolver']!.text = '8.8.8.8:53';
+      dtrans = 'udp';
+      dmethod = 'ssh';
+    }
     if (proto == 'ssh') {
       c['port']!.text = '22';
       smode = 'direct';
@@ -791,6 +836,48 @@ class _ConfigEditorState extends State<ConfigEditor> {
             'GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]';
       }
     }
+  }
+
+  Future<void> scanDns() async {
+    final dom = c['domain']!.text.trim();
+    if (dom.isEmpty) return _err('Entre d\'abord le domaine du tunnel');
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => const AlertDialog(
+        content: Row(children: [
+          CircularProgressIndicator(),
+          SizedBox(width: 16),
+          Text('Test des résolveurs...'),
+        ]),
+      ),
+    );
+    final res = await Future.wait(kResolvers.map((r) async => MapEntry(r, await dnsProbe(r, dom))));
+    if (!mounted) return;
+    Navigator.pop(context);
+    final ok = res.where((e) => e.value >= 0).toList()..sort((a, b) => a.value.compareTo(b.value));
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(ok.isEmpty ? 'Aucun résolveur ne répond' : 'Résolveurs qui répondent'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: ListView(shrinkWrap: true, children: [
+            for (final e in ok)
+              ListTile(
+                dense: true,
+                title: Text(e.key),
+                trailing: Text('${e.value} ms'),
+                onTap: () {
+                  c['resolver']!.text = e.key;
+                  Navigator.pop(ctx);
+                },
+              ),
+          ]),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer'))],
+      ),
+    );
   }
 
   void _err(String m) =>
@@ -804,9 +891,17 @@ class _ConfigEditorState extends State<ConfigEditor> {
     f.addAll(extra);
     f['ins'] = insecure ? '1' : '0';
     f['mode'] = smode;
+    f['transport'] = dtrans;
+    f['smethod'] = dmethod;
     final link = buildLink(f);
     if (link == null) return _err('Le serveur cible est obligatoire');
-    if (proto == 'ssh') {
+    if (proto == 'dns') {
+      if ((f['domain'] ?? '').isEmpty) return _err('Domaine du tunnel obligatoire');
+      if (!RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(f['pubkey'] ?? '')) {
+        return _err('Clé publique : 64 caractères hexadécimaux');
+      }
+      if (dmethod == 'ssh' && (f['user'] ?? '').isEmpty) return _err('Utilisateur SSH obligatoire');
+    } else if (proto == 'ssh') {
       if ((f['user'] ?? '').isEmpty) return _err('Utilisateur SSH obligatoire');
     } else {
       try {
@@ -820,7 +915,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
       return _err('Date invalide (ex : 2026-12-31)');
     }
     final old = widget.cfg;
-    final name = f['remark']!.isEmpty ? f['add']! : f['remark']!;
+    final name = f['remark']!.isEmpty ? (proto == 'dns' ? f['domain']! : f['add']!) : f['remark']!;
     Navigator.pop(
       context,
       Cfg(name, link, false,
@@ -876,7 +971,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
         ),
         body: ListView(padding: const EdgeInsets.all(16), children: [
           if (isNew)
-            drop('Protocole', proto, ['vmess', 'vless', 'trojan', 'ss', 'ssh'],
+            drop('Protocole', proto, ['vmess', 'vless', 'trojan', 'ss', 'ssh', 'dns'],
                 (v) => setState(() {
                       proto = v;
                       _defaults();
@@ -886,11 +981,12 @@ class _ConfigEditorState extends State<ConfigEditor> {
                   'vless': 'VLESS',
                   'trojan': 'Trojan',
                   'ss': 'Shadowsocks',
-                  'ssh': 'SSH (tunnel)'
+                  'ssh': 'SSH (tunnel)',
+                  'dns': 'DNS tunnel (SlowDNS / DNSTT)'
                 }),
           field('remark', 'Nom'),
-          field('add', 'Serveur cible (target)'),
-          field('port', 'Port', type: TextInputType.number),
+          if (proto != 'dns') field('add', 'Serveur cible (target)'),
+          if (proto != 'dns') field('port', 'Port', type: TextInputType.number),
           if (proto == 'vmess') ...[
             field('id', 'UUID'),
             field('aid', 'AlterId', type: TextInputType.number),
@@ -906,6 +1002,31 @@ class _ConfigEditorState extends State<ConfigEditor> {
             field('flow', 'Flow (facultatif)'),
           ],
           if (proto == 'trojan') field('id', 'Mot de passe'),
+          if (proto == 'dns') ...[
+            field('domain', 'Domaine du tunnel (NS)'),
+            field('pubkey', 'Clé publique (64 caractères hexadécimaux)'),
+            drop('Transport DNS', dtrans, ['udp', 'dot', 'doh'], (v) => setState(() => dtrans = v),
+                names: {'udp': 'UDP', 'dot': 'DoT (TLS)', 'doh': 'DoH (HTTPS)'}),
+            field('resolver', 'Résolveur DNS (hôte:port)'),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: OutlinedButton.icon(
+                onPressed: scanDns,
+                icon: const Icon(Icons.search),
+                label: const Text('Chercher des résolveurs qui marchent'),
+              ),
+            ),
+            drop('Méthode de connexion', dmethod, ['ssh', 'socks'], (v) => setState(() => dmethod = v),
+                names: {'ssh': 'SSH (dans le tunnel)', 'socks': 'SOCKS'}),
+            if (dmethod == 'ssh') ...[
+              field('port', 'Port SSH', type: TextInputType.number),
+              field('user', 'Utilisateur SSH'),
+              field('id', 'Mot de passe SSH'),
+            ] else ...[
+              field('suser', 'Utilisateur SOCKS5 (facultatif)'),
+              field('spass', 'Mot de passe SOCKS5 (facultatif)'),
+            ],
+          ],
           if (proto == 'ssh') ...[
             field('user', 'Utilisateur SSH'),
             field('id', 'Mot de passe'),
@@ -927,7 +1048,7 @@ class _ConfigEditorState extends State<ConfigEditor> {
             field('method', 'Méthode (ex : aes-256-gcm)'),
             field('id', 'Mot de passe'),
           ],
-          if (proto != 'ss' && proto != 'ssh') ...[
+          if (proto != 'ss' && proto != 'ssh' && proto != 'dns') ...[
             drop('Réseau', net, ['tcp', 'ws', 'grpc', 'h2', 'httpupgrade', 'kcp', 'quic'],
                 (v) => setState(() => net = v)),
             drop('En-tête (head type)', vtype,
@@ -1100,6 +1221,7 @@ List<String> expandPayload(String p, String host, int port) {
       .replaceAll('[host_port]', '$host:$port')
       .replaceAll('[host]', host)
       .replaceAll('[port]', '$port')
+      .replaceAll('[method]', 'CONNECT')
       .replaceAll('[protocol]', 'HTTP/1.1')
       .replaceAll('[ua]', 'Mozilla/5.0');
   return s.split('[split]');
@@ -1206,7 +1328,7 @@ class SshTunnel {
   void Function()? onClosed;
   bool stopped = false;
 
-  Future<void> start(Map<String, String> f, void Function(String) log) async {
+  Future<void> start(Map<String, String> f, void Function(String) log, {int authSecs = 25}) async {
     stopped = false;
     final host = f['add'] ?? '';
     final port = int.tryParse(f['port'] ?? '') ?? 22;
@@ -1236,7 +1358,7 @@ class SshTunnel {
       keepAliveInterval: const Duration(seconds: 15),
     );
     client = c;
-    await c.authenticated.timeout(const Duration(seconds: 25));
+    await c.authenticated.timeout(Duration(seconds: authSecs));
     c.done.then((_) {
       if (!stopped) onClosed?.call();
     }, onError: (Object _) {
@@ -1338,7 +1460,7 @@ String flagOf(String cc) => cc.length == 2
     ? String.fromCharCodes(cc.toUpperCase().codeUnits.map((c) => 0x1F1E6 + c - 65))
     : '🌐';
 
-const kSteps = ['Config', 'Tunnel SSH', 'Moteur', 'Trafic', 'IP / lieu'];
+const kSteps = ['Config', 'Tunnel', 'Moteur', 'Trafic', 'IP / lieu'];
 
 String fillVars(String s, Map<String, String> v) {
   var out = s;
@@ -1355,6 +1477,7 @@ String decodeEntities(String s) => s
     .replaceAllMapped(RegExp(r'&#(\d+);'), (m) => String.fromCharCode(int.parse(m.group(1)!)))
     .replaceAll('&amp;', '&');
 
+// ---------- Rendu des messages : HTML/CSS limité, animations et liens (jamais de script) ----------
 Color? parseCssColor(String raw) {
   final v = raw.trim().toLowerCase();
   const names = <String, int>{
@@ -1364,6 +1487,17 @@ Color? parseCssColor(String raw) {
     'cyan': 0xFF00FFFF, 'aqua': 0xFF00FFFF, 'magenta': 0xFFFF00FF, 'fuchsia': 0xFFFF00FF,
     'gold': 0xFFFFD700, 'silver': 0xFFC0C0C0, 'brown': 0xFFA52A2A, 'violet': 0xFFEE82EE,
     'indigo': 0xFF4B0082, 'teal': 0xFF008080, 'navy': 0xFF000080, 'crimson': 0xFFDC143C,
+    'orangered': 0xFFFF4500, 'hotpink': 0xFFFF69B4, 'deeppink': 0xFFFF1493, 'tomato': 0xFFFF6347,
+    'coral': 0xFFFF7F50, 'salmon': 0xFFFA8072, 'skyblue': 0xFF87CEEB, 'dodgerblue': 0xFF1E90FF,
+    'royalblue': 0xFF4169E1, 'lightblue': 0xFFADD8E6, 'lightgreen': 0xFF90EE90, 'darkgreen': 0xFF006400,
+    'darkred': 0xFF8B0000, 'darkblue': 0xFF00008B, 'chartreuse': 0xFF7FFF00, 'springgreen': 0xFF00FF7F,
+    'turquoise': 0xFF40E0D0, 'lavender': 0xFFE6E6FA, 'plum': 0xFFDDA0DD, 'orchid': 0xFFDA70D6,
+    'khaki': 0xFFF0E68C, 'maroon': 0xFF800000, 'olive': 0xFF808000, 'beige': 0xFFF5F5DC,
+    'ivory': 0xFFFFFFF0, 'wheat': 0xFFF5DEB3, 'tan': 0xFFD2B48C, 'chocolate': 0xFFD2691E,
+    'firebrick': 0xFFB22222, 'steelblue': 0xFF4682B4, 'slateblue': 0xFF6A5ACD, 'blueviolet': 0xFF8A2BE2,
+    'darkviolet': 0xFF9400D3, 'deepskyblue': 0xFF00BFFF, 'limegreen': 0xFF32CD32, 'forestgreen': 0xFF228B22,
+    'seagreen': 0xFF2E8B57, 'lightyellow': 0xFFFFFFE0, 'lightpink': 0xFFFFB6C1, 'lightgray': 0xFFD3D3D3,
+    'lightgrey': 0xFFD3D3D3, 'darkgray': 0xFFA9A9A9, 'darkgrey': 0xFFA9A9A9, 'transparent': 0x00000000,
   };
   if (names.containsKey(v)) return Color(names[v]!);
   if (v.startsWith('#')) {
@@ -1373,231 +1507,885 @@ Color? parseCssColor(String raw) {
       final n = int.tryParse(h, radix: 16);
       if (n != null) return Color(0xFF000000 | n);
     }
+    if (h.length == 8) {
+      final n = int.tryParse(h, radix: 16);
+      if (n != null) return Color(((n & 0xFF) << 24) | (n >> 8));
+    }
   }
-  final m = RegExp(r'rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)').firstMatch(v);
+  final m = RegExp(r'rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)').firstMatch(v);
   if (m != null) {
-    return Color.fromARGB(255, int.parse(m.group(1)!).clamp(0, 255),
+    final a = m.group(4) == null ? 1.0 : (double.tryParse(m.group(4)!) ?? 1.0);
+    return Color.fromARGB((a.clamp(0.0, 1.0) * 255).round(), int.parse(m.group(1)!).clamp(0, 255),
         int.parse(m.group(2)!).clamp(0, 255), int.parse(m.group(3)!).clamp(0, 255));
   }
   return null;
 }
 
-class _Sty {
-  Color? color, bg;
+class HNode {
+  final String tag;
+  final String text;
+  final Map<String, String> attrs;
+  final List<HNode> kids = [];
+  HNode(this.tag, {this.text = '', Map<String, String>? attrs}) : attrs = attrs ?? {};
+}
+
+const _voidTags = {'br', 'hr', 'img', 'input', 'meta', 'link', 'source'};
+const _blockTags = {
+  'div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'center', 'pre',
+  'blockquote', 'section', 'article', 'header', 'footer', 'marquee', 'hr', 'body', 'html'
+};
+
+class _TS {
+  Color color;
   double size;
-  bool b, i, u, s, mono;
+  bool b, i, u, s, mono, upper;
+  Color? bg;
+  double? ls;
+  List<Shadow> sh;
   TextAlign? align;
-  _Sty(this.size,
-      {this.color,
-      this.bg,
-      this.b = false,
+  _TS(this.color, this.size,
+      {this.b = false,
       this.i = false,
       this.u = false,
       this.s = false,
       this.mono = false,
-      this.align});
-  _Sty copy() =>
-      _Sty(size, color: color, bg: bg, b: b, i: i, u: u, s: s, mono: mono, align: align);
+      this.upper = false,
+      this.bg,
+      this.ls,
+      List<Shadow>? sh,
+      this.align})
+      : sh = sh ?? const [];
+  _TS copy() => _TS(color, size,
+      b: b, i: i, u: u, s: s, mono: mono, upper: upper, bg: bg, ls: ls, sh: sh, align: align);
+  TextStyle style() => TextStyle(
+        color: color,
+        fontSize: size,
+        fontWeight: b ? FontWeight.bold : FontWeight.normal,
+        fontStyle: i ? FontStyle.italic : FontStyle.normal,
+        backgroundColor: bg,
+        letterSpacing: ls,
+        shadows: sh.isEmpty ? null : sh,
+        fontFamily: mono ? 'monospace' : null,
+        decoration: TextDecoration.combine([
+          if (u) TextDecoration.underline,
+          if (s) TextDecoration.lineThrough,
+        ]),
+      );
 }
 
-String? _attr(String attrs, String name) {
-  final m = RegExp('$name\\s*=\\s*"([^"]*)"', caseSensitive: false).firstMatch(attrs) ??
-      RegExp("$name\\s*=\\s*'([^']*)'", caseSensitive: false).firstMatch(attrs) ??
-      RegExp('$name\\s*=\\s*([^\\s>"\']+)', caseSensitive: false).firstMatch(attrs);
-  return m?.group(1);
+Map<String, String> _parseAttrs(String a) {
+  final out = <String, String>{};
+  for (final m in RegExp(
+          r'''([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?''')
+      .allMatches(a)) {
+    out[m.group(1)!.toLowerCase()] = m.group(2) ?? m.group(3) ?? m.group(4) ?? '';
+  }
+  return out;
 }
 
-void _css(_Sty s, String css, double base) {
-  for (final m in RegExp(r'([a-zA-Z-]+)\s*:\s*([^;]+)').allMatches(css)) {
-    final k = m.group(1)!.toLowerCase();
-    final v = m.group(2)!.trim().toLowerCase();
+HNode _parseHtml(String src) {
+  final root = HNode('#root');
+  final stack = <HNode>[root];
+  for (final m in RegExp(r'<[^>]*>|[^<]+').allMatches(src)) {
+    final tok = m.group(0)!;
+    if (!tok.startsWith('<')) {
+      stack.last.kids.add(HNode('', text: tok));
+      continue;
+    }
+    final tm = RegExp(r'^<\s*(/?)\s*([a-zA-Z][a-zA-Z0-9]*)([\s\S]*?)(/?)>$').firstMatch(tok);
+    if (tm == null) continue;
+    final closing = tm.group(1) == '/';
+    final tag = tm.group(2)!.toLowerCase();
+    if (closing) {
+      for (var i = stack.length - 1; i > 0; i--) {
+        if (stack[i].tag == tag) {
+          stack.removeRange(i, stack.length);
+          break;
+        }
+      }
+      continue;
+    }
+    final node = HNode(tag, attrs: _parseAttrs(tm.group(3) ?? ''));
+    stack.last.kids.add(node);
+    final selfClose = tm.group(4) == '/' || _voidTags.contains(tag);
+    if (!selfClose && stack.length < 40) stack.add(node);
+  }
+  return root;
+}
+
+List<String> _splitTop(String s) {
+  final out = <String>[];
+  var depth = 0;
+  var cur = StringBuffer();
+  for (final ch in s.split('')) {
+    if (ch == '(') depth++;
+    if (ch == ')') depth--;
+    if (ch == ',' && depth == 0) {
+      out.add(cur.toString().trim());
+      cur = StringBuffer();
+    } else {
+      cur.write(ch);
+    }
+  }
+  if (cur.toString().trim().isNotEmpty) out.add(cur.toString().trim());
+  return out;
+}
+
+LinearGradient? _gradient(String v) {
+  final m = RegExp(r'linear-gradient\((.*)\)', caseSensitive: false, dotAll: true).firstMatch(v);
+  if (m == null) return null;
+  var begin = Alignment.topCenter, end = Alignment.bottomCenter;
+  final colors = <Color>[];
+  for (final p in _splitTop(m.group(1)!)) {
+    final t = p.trim();
+    final a = RegExp(r'^(-?[\d.]+)deg$').firstMatch(t);
+    if (a != null) {
+      final r = double.parse(a.group(1)!) * pi / 180;
+      begin = Alignment(-sin(r), cos(r));
+      end = Alignment(sin(r), -cos(r));
+      continue;
+    }
+    if (t.startsWith('to ')) {
+      if (t.contains('right')) {
+        begin = Alignment.centerLeft;
+        end = Alignment.centerRight;
+      } else if (t.contains('left')) {
+        begin = Alignment.centerRight;
+        end = Alignment.centerLeft;
+      } else if (t.contains('top')) {
+        begin = Alignment.bottomCenter;
+        end = Alignment.topCenter;
+      }
+      continue;
+    }
+    final tok = t.split(RegExp(r'\s+(?![^(]*\))')).first;
+    final c = parseCssColor(tok);
+    if (c != null) colors.add(c);
+  }
+  if (colors.length < 2) return null;
+  return LinearGradient(begin: begin, end: end, colors: colors);
+}
+
+double? _px(String? v) {
+  if (v == null) return null;
+  final m = RegExp(r'(-?[\d.]+)\s*(px|pt|em|rem)?').firstMatch(v);
+  if (m == null) return null;
+  final n = double.tryParse(m.group(1)!);
+  if (n == null) return null;
+  final u = m.group(2);
+  return (u == 'em' || u == 'rem') ? n * 14 : (u == 'pt' ? n * 1.33 : n);
+}
+
+EdgeInsets? _insets(String? v) {
+  if (v == null) return null;
+  final p = v
+      .trim()
+      .split(RegExp(r'\s+'))
+      .map((e) => (_px(e) ?? 0).clamp(0.0, 60.0).toDouble())
+      .toList();
+  if (p.isEmpty) return null;
+  if (p.length == 1) return EdgeInsets.all(p[0]);
+  if (p.length == 2) return EdgeInsets.symmetric(vertical: p[0], horizontal: p[1]);
+  if (p.length == 3) return EdgeInsets.fromLTRB(p[1], p[0], p[1], p[2]);
+  return EdgeInsets.fromLTRB(p[3], p[0], p[1], p[2]);
+}
+
+List<Shadow> _shadows(String v) {
+  final out = <Shadow>[];
+  for (final part in _splitTop(v)) {
+    final colorRe = RegExp(r'rgba?\([^)]*\)|#[0-9a-fA-F]{3,8}|[a-zA-Z]+');
+    Color? col;
+    for (final m in colorRe.allMatches(part)) {
+      final c = parseCssColor(m.group(0)!);
+      if (c != null) {
+        col = c;
+        break;
+      }
+    }
+    final rest = part.replaceAll(colorRe, ' ');
+    final nums = RegExp(r'-?[\d.]+')
+        .allMatches(rest)
+        .map((m) => double.tryParse(m.group(0)!) ?? 0.0)
+        .toList();
+    if (nums.length >= 2) {
+      out.add(Shadow(
+          color: col ?? Colors.white,
+          offset: Offset(nums[0], nums[1]),
+          blurRadius: nums.length > 2 ? nums[2] : 0));
+    }
+  }
+  return out;
+}
+
+_TS _apply(_TS p, Map<String, String> css, double base) {
+  final s = p.copy();
+  css.forEach((k, v0) {
+    final v = v0.trim().toLowerCase();
     if (k == 'color') {
-      s.color = parseCssColor(v) ?? s.color;
+      final c = parseCssColor(v);
+      if (c != null) s.color = c;
     } else if (k == 'background' || k == 'background-color') {
-      s.bg = parseCssColor(v) ?? s.bg;
+      final c = parseCssColor(v.split(RegExp(r'\s+(?![^(]*\))')).first);
+      if (c != null) s.bg = c;
     } else if (k == 'font-size') {
-      final n = double.tryParse(RegExp(r'[\d.]+').firstMatch(v)?.group(0) ?? '');
+      final n = _px(v);
       if (n != null) {
-        if (v.contains('em')) {
-          s.size = base * n;
-        } else if (v.contains('%')) {
+        if (v.contains('%')) {
           s.size = base * n / 100;
-        } else if (v.contains('pt')) {
-          s.size = n * 1.33;
+        } else if (v.contains('em')) {
+          s.size = base * n / 14;
         } else {
           s.size = n;
         }
-        s.size = s.size.clamp(8.0, 48.0);
+        s.size = s.size.clamp(8.0, 60.0).toDouble();
       }
     } else if (k == 'font-weight') {
       s.b = v.contains('bold') || (int.tryParse(v) ?? 0) >= 600;
     } else if (k == 'font-style') {
       s.i = v.contains('italic');
-    } else if (k == 'text-decoration') {
-      if (v.contains('underline')) s.u = true;
-      if (v.contains('line-through')) s.s = true;
+    } else if (k == 'font-family') {
+      s.mono = v.contains('mono') || v.contains('courier');
+    } else if (k == 'text-decoration' || k == 'text-decoration-line') {
+      s.u = v.contains('underline');
+      s.s = v.contains('line-through');
     } else if (k == 'text-align') {
       s.align = v.contains('center')
           ? TextAlign.center
           : (v.contains('right') ? TextAlign.right : TextAlign.left);
+    } else if (k == 'letter-spacing') {
+      s.ls = _px(v);
+    } else if (k == 'text-transform') {
+      s.upper = v.contains('uppercase');
+    } else if (k == 'text-shadow') {
+      s.sh = _shadows(v0);
     }
-  }
+  });
+  return s;
 }
 
-TextStyle _ts(_Sty s) => TextStyle(
-      color: s.color ?? Colors.white,
-      fontSize: s.size,
-      fontWeight: s.b ? FontWeight.bold : FontWeight.normal,
-      fontStyle: s.i ? FontStyle.italic : FontStyle.normal,
-      backgroundColor: s.bg,
-      fontFamily: s.mono ? 'monospace' : null,
-      decoration: TextDecoration.combine([
-        if (s.u) TextDecoration.underline,
-        if (s.s) TextDecoration.lineThrough,
-      ]),
-    );
-
-// Affiche un message : texte simple ou HTML limité (sans script, sans image, sans lien).
-Widget richMessage(String input, {double base = 14}) {
-  final src = input.length > 4000 ? input.substring(0, 4000) : input;
-  final cleaned = src
-      .replaceAll(RegExp(r'<!--[\s\S]*?-->'), '')
-      .replaceAll(
-          RegExp(r'<(script|style|iframe|object|embed)[\s\S]*?</\1\s*>', caseSensitive: false), '');
-  if (!RegExp(r'<[a-zA-Z/]').hasMatch(cleaned)) {
-    return Text(decodeEntities(cleaned), style: TextStyle(color: Colors.white, fontSize: base));
+_TS _tagDefaults(HNode n, _TS inh, double base) {
+  final s = inh.copy();
+  switch (n.tag) {
+    case 'b':
+    case 'strong':
+      s.b = true;
+      break;
+    case 'i':
+    case 'em':
+    case 'cite':
+      s.i = true;
+      break;
+    case 'u':
+    case 'ins':
+      s.u = true;
+      break;
+    case 's':
+    case 'strike':
+    case 'del':
+      s.s = true;
+      break;
+    case 'small':
+      s.size = s.size * 0.85;
+      break;
+    case 'big':
+      s.size = s.size * 1.2;
+      break;
+    case 'sub':
+    case 'sup':
+      s.size = s.size * 0.75;
+      break;
+    case 'code':
+    case 'pre':
+    case 'tt':
+    case 'kbd':
+      s.mono = true;
+      break;
+    case 'mark':
+      s.bg = const Color(0xFFFFEB3B);
+      s.color = Colors.black;
+      break;
+    case 'h1':
+      s.size = base * 1.8;
+      s.b = true;
+      break;
+    case 'h2':
+      s.size = base * 1.5;
+      s.b = true;
+      break;
+    case 'h3':
+      s.size = base * 1.25;
+      s.b = true;
+      break;
+    case 'h4':
+      s.size = base * 1.1;
+      s.b = true;
+      break;
+    case 'h5':
+    case 'h6':
+      s.b = true;
+      break;
+    case 'a':
+      s.color = const Color(0xFF64B5F6);
+      s.u = true;
+      break;
+    case 'button':
+      s.b = true;
+      break;
+    case 'font':
+      final c = n.attrs['color'];
+      if (c != null) s.color = parseCssColor(c) ?? s.color;
+      final sz = int.tryParse(n.attrs['size'] ?? '');
+      if (sz != null) s.size = base * (0.7 + 0.15 * sz.clamp(1, 7));
+      break;
   }
-  try {
-    const blockTags = {'p', 'div', 'h1', 'h2', 'h3', 'h4', 'li', 'ul', 'ol', 'center', 'pre', 'blockquote'};
-    final blocks = <Widget>[];
-    var spans = <InlineSpan>[];
-    var align = TextAlign.start;
-    final stack = <_Sty>[_Sty(base, color: Colors.white)];
-    final tags = <String>['#root'];
-    void flush() {
-      if (spans.isEmpty) return;
-      blocks.add(Padding(
-        padding: const EdgeInsets.only(bottom: 6),
-        child: SizedBox(
-            width: double.infinity,
-            child: Text.rich(TextSpan(children: spans), textAlign: align)),
-      ));
-      spans = <InlineSpan>[];
+  return s;
+}
+
+String _plainOf(HNode n) {
+  if (n.tag.isEmpty) return decodeEntities(n.text.replaceAll(RegExp(r'\s+'), ' '));
+  if (n.tag == 'br') return '\n';
+  return n.kids.map(_plainOf).join();
+}
+
+String? _animFromName(String name, Map<String, String> kf) {
+  final n = name.toLowerCase();
+  if (n.contains('blink') || n.contains('flash')) return 'blink';
+  if (n.contains('pulse') || n.contains('beat') || n.contains('heart')) return 'pulse';
+  if (n.contains('glow') || n.contains('neon') || n.contains('shine')) return 'glow';
+  if (n.contains('rainbow') || n.contains('hue') || n.contains('color')) return 'rainbow';
+  if (n.contains('shake') || n.contains('vibrate') || n.contains('wobble')) return 'shake';
+  if (n.contains('bounce') || n.contains('jump')) return 'bounce';
+  if (n.contains('fade')) return 'fade';
+  if (n.contains('wave')) return 'wave';
+  if (n.contains('typ')) return 'typewriter';
+  if (n.contains('marquee') || n.contains('scroll') || n.contains('slide')) return 'marquee';
+  if (n.contains('spin') || n.contains('rotate')) return 'spin';
+  final body = kf[n];
+  if (body != null) {
+    if (body.contains('color')) return 'rainbow';
+    if (body.contains('opacity')) return 'blink';
+    if (body.contains('rotate')) return 'spin';
+    if (body.contains('translate')) return 'bounce';
+    return 'pulse';
+  }
+  return null;
+}
+
+class _Render {
+  final Map<String, String> sheet;
+  final Map<String, String> kf;
+  final double base;
+  final void Function(String)? onLink;
+  _Render(this.sheet, this.kf, this.base, this.onLink);
+
+  Map<String, String> css(HNode n) {
+    final m = <String, String>{};
+    void merge(String? s) {
+      if (s == null) return;
+      for (final x in RegExp(r'([a-zA-Z-]+)\s*:\s*([^;]+)').allMatches(s)) {
+        m[x.group(1)!.toLowerCase()] = x.group(2)!.trim();
+      }
     }
 
-    for (final m in RegExp(r'<[^>]*>|[^<]+').allMatches(cleaned)) {
-      final tok = m.group(0)!;
-      if (!tok.startsWith('<')) {
-        final t = decodeEntities(tok.replaceAll(RegExp(r'\s+'), ' '));
-        if (t.trim().isEmpty && spans.isEmpty) continue;
-        spans.add(TextSpan(text: t, style: _ts(stack.last)));
-        continue;
+    merge(sheet[n.tag]);
+    for (final c in (n.attrs['class'] ?? '').toLowerCase().split(RegExp(r'\s+'))) {
+      if (c.isEmpty) continue;
+      merge(sheet['.$c']);
+      merge(sheet['${n.tag}.$c']);
+    }
+    final id = n.attrs['id'];
+    if (id != null) merge(sheet['#${id.toLowerCase()}']);
+    merge(n.attrs['style']);
+    return m;
+  }
+
+  bool isBlock(HNode n, Map<String, String> c) =>
+      _blockTags.contains(n.tag) ||
+      const {'block', 'flex', 'grid', 'list-item'}.contains((c['display'] ?? '').toLowerCase());
+
+  bool gradText(Map<String, String> c) {
+    final bg = (c['background'] ?? c['background-image'] ?? '').toLowerCase();
+    final clip = (c['background-clip'] ?? c['-webkit-background-clip'] ?? '').toLowerCase();
+    final fill = (c['-webkit-text-fill-color'] ?? c['color'] ?? '').toLowerCase();
+    return bg.contains('linear-gradient') && (clip.contains('text') || fill == 'transparent');
+  }
+
+  String? animKind(Map<String, String> c, HNode n) {
+    if (n.tag == 'blink') return 'blink';
+    var raw = (c['animation-name'] ?? c['animation'] ?? n.attrs['data-anim'] ?? '').toLowerCase();
+    if (raw.isEmpty) {
+      for (final cl in (n.attrs['class'] ?? '').split(RegExp(r'\s+'))) {
+        final k = cl.isEmpty ? null : _animFromName(cl, kf);
+        if (k != null && cl.length > 2) return k;
       }
-      final tm = RegExp(r'^<\s*(/?)\s*([a-zA-Z0-9]+)([^>]*)>$').firstMatch(tok);
-      if (tm == null) continue;
-      final closing = tm.group(1) == '/';
-      final tag = tm.group(2)!.toLowerCase();
-      final attrs = tm.group(3) ?? '';
-      if (tag == 'br') {
-        spans.add(const TextSpan(text: '\n'));
-        continue;
-      }
-      if (tag == 'hr') {
-        flush();
-        blocks.add(const Divider(color: Colors.white24));
-        continue;
-      }
-      if (!closing) {
-        final st = stack.last.copy();
-        switch (tag) {
-          case 'b':
-          case 'strong':
-            st.b = true;
-            break;
-          case 'i':
-          case 'em':
-            st.i = true;
-            break;
-          case 'u':
-            st.u = true;
-            break;
-          case 's':
-          case 'strike':
-          case 'del':
-            st.s = true;
-            break;
-          case 'small':
-            st.size = st.size * 0.85;
-            break;
-          case 'big':
-            st.size = st.size * 1.2;
-            break;
-          case 'code':
-          case 'pre':
-          case 'tt':
-            st.mono = true;
-            break;
-          case 'h1':
-            st.size = base * 1.8;
-            st.b = true;
-            break;
-          case 'h2':
-            st.size = base * 1.5;
-            st.b = true;
-            break;
-          case 'h3':
-            st.size = base * 1.25;
-            st.b = true;
-            break;
-          case 'h4':
-            st.size = base * 1.1;
-            st.b = true;
-            break;
-          case 'center':
-            st.align = TextAlign.center;
-            break;
-          case 'font':
-            final c = _attr(attrs, 'color');
-            if (c != null) st.color = parseCssColor(c) ?? st.color;
-            final sz = int.tryParse(_attr(attrs, 'size') ?? '');
-            if (sz != null) st.size = base * (0.7 + 0.15 * sz.clamp(1, 7));
-            break;
-        }
-        final css = _attr(attrs, 'style');
-        if (css != null) _css(st, css, base);
-        final al = _attr(attrs, 'align');
-        if (al != null) {
-          st.align = al.contains('center')
-              ? TextAlign.center
-              : (al.contains('right') ? TextAlign.right : st.align);
-        }
-        if (blockTags.contains(tag)) {
-          flush();
-          if (tag == 'li') spans.add(TextSpan(text: '• ', style: _ts(st)));
-        }
-        stack.add(st);
-        tags.add(tag);
-        if (blockTags.contains(tag)) align = st.align ?? TextAlign.start;
+      return null;
+    }
+    raw = raw.replaceAll(RegExp(r'[\d.]+m?s'), ' ').trim();
+    for (final w in raw.split(RegExp(r'[\s,]+'))) {
+      if (w.isEmpty || const {'infinite', 'linear', 'ease', 'alternate', 'forwards'}.contains(w)) continue;
+      final k = _animFromName(w, kf);
+      if (k != null) return k;
+    }
+    return 'pulse';
+  }
+
+  int dur(Map<String, String> c) {
+    final raw = (c['animation-duration'] ?? c['animation'] ?? '').toLowerCase();
+    final m = RegExp(r'([\d.]+)(ms|s)').firstMatch(raw);
+    if (m == null) return 0;
+    final n = double.tryParse(m.group(1)!) ?? 1;
+    return (m.group(2) == 'ms' ? n : n * 1000).round().clamp(150, 20000);
+  }
+
+  List<InlineSpan> inlineKids(List<HNode> kids, _TS st, GestureRecognizer? rec) {
+    final out = <InlineSpan>[];
+    for (final k in kids) {
+      if (k.tag.isEmpty) {
+        var t = decodeEntities(k.text.replaceAll(RegExp(r'\s+'), ' '));
+        if (t.isEmpty) continue;
+        if (st.upper) t = t.toUpperCase();
+        out.add(TextSpan(text: t, style: st.style(), recognizer: rec));
+      } else if (k.tag == 'br') {
+        out.add(const TextSpan(text: '\n'));
       } else {
-        final idx = tags.lastIndexOf(tag);
-        if (idx > 0) {
-          while (tags.length > idx) {
-            tags.removeLast();
-            stack.removeLast();
-          }
-        }
-        if (blockTags.contains(tag)) {
-          flush();
-          align = stack.last.align ?? TextAlign.start;
-        }
+        out.addAll(inlineS(k, st, rec));
+      }
+    }
+    return out;
+  }
+
+  List<InlineSpan> inlineS(HNode n, _TS inh, GestureRecognizer? rec) {
+    final c = css(n);
+    if ((c['display'] ?? '') == 'none' || n.tag == 'img' || n.tag == 'input' || n.tag == 'hr') {
+      return const [];
+    }
+    var st = _tagDefaults(n, inh, base);
+    st = _apply(st, c, base);
+    GestureRecognizer? r = rec;
+    if (n.tag == 'a') {
+      final href = (n.attrs['href'] ?? '').trim();
+      final cb = onLink;
+      if (href.isNotEmpty && cb != null) r = TapGestureRecognizer()..onTap = () => cb(href);
+    }
+    final gt = gradText(c);
+    if (gt) st.color = Colors.white;
+    final kids = inlineKids(n.kids, st, r);
+    final anim = animKind(c, n);
+    final g = gt ? _gradient(c['background'] ?? c['background-image'] ?? '') : null;
+    if (g == null && (anim == null || anim == 'marquee')) return kids;
+    Widget w = Text.rich(TextSpan(children: kids), textAlign: st.align);
+    if (g != null) {
+      w = ShaderMask(blendMode: BlendMode.srcIn, shaderCallback: (rc) => g.createShader(rc), child: w);
+    }
+    if (anim != null && anim != 'marquee') {
+      w = AnimBox(kind: anim, plain: _plainOf(n), style: st.style(), ms: dur(c), child: w);
+    }
+    return [WidgetSpan(alignment: PlaceholderAlignment.middle, child: w)];
+  }
+
+  Widget flow(List<HNode> kids, _TS st, {String bullet = ''}) {
+    final items = <Widget>[];
+    var run = <InlineSpan>[];
+    void flush() {
+      if (run.isEmpty) return;
+      items.add(Padding(
+        padding: const EdgeInsets.only(bottom: 2),
+        child: SizedBox(
+            width: double.infinity,
+            child: Text.rich(TextSpan(children: run), textAlign: st.align ?? TextAlign.start)),
+      ));
+      run = <InlineSpan>[];
+    }
+
+    if (bullet.isNotEmpty) run.add(TextSpan(text: bullet, style: st.style()));
+    for (final k in kids) {
+      if (k.tag.isEmpty) {
+        var t = decodeEntities(k.text.replaceAll(RegExp(r'\s+'), ' '));
+        if (run.isEmpty) t = t.trimLeft();
+        if (t.isEmpty) continue;
+        if (st.upper) t = t.toUpperCase();
+        run.add(TextSpan(text: t, style: st.style()));
+        continue;
+      }
+      if (k.tag == 'br') {
+        run.add(const TextSpan(text: '\n'));
+        continue;
+      }
+      final c = css(k);
+      if (isBlock(k, c)) {
+        flush();
+        items.add(blockW(k, st));
+      } else {
+        run.addAll(inlineS(k, st, null));
       }
     }
     flush();
-    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: blocks);
+    if (items.isEmpty) return const SizedBox.shrink();
+    if (items.length == 1) return items.first;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: items);
+  }
+
+  Widget blockW(HNode n, _TS inh, {String bullet = ''}) {
+    final c = css(n);
+    if ((c['display'] ?? '') == 'none') return const SizedBox.shrink();
+    if (n.tag == 'hr') return const Padding(padding: EdgeInsets.symmetric(vertical: 4), child: Divider(color: Colors.white24));
+    var st = _tagDefaults(n, inh, base);
+    st = _apply(st, c, base);
+    st.bg = inh.bg;
+    if (n.tag == 'center') st.align = TextAlign.center;
+    final al = n.attrs['align'];
+    if (al != null) {
+      st.align = al.contains('center')
+          ? TextAlign.center
+          : (al.contains('right') ? TextAlign.right : TextAlign.left);
+    }
+    final gt = gradText(c);
+    if (gt) st.color = Colors.white;
+    final bgv = c['background'] ?? c['background-image'] ?? c['background-color'];
+    Color? bgColor;
+    Gradient? bgGrad;
+    if (bgv != null && !gt) {
+      bgGrad = _gradient(bgv);
+      if (bgGrad == null) bgColor = parseCssColor(bgv.split(RegExp(r'\s+(?![^(]*\))')).first);
+    }
+    Widget content;
+    if (n.tag == 'ul' || n.tag == 'ol') {
+      var idx = 0;
+      content = Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        for (final k in n.kids)
+          if (k.tag == 'li') blockW(k, st, bullet: n.tag == 'ol' ? '${++idx}. ' : '• '),
+      ]);
+    } else if (n.tag == 'marquee') {
+      content = Marquee(
+        plain: _plainOf(n),
+        child: Text.rich(TextSpan(children: inlineKids(n.kids, st, null)), maxLines: 1, softWrap: false),
+      );
+    } else {
+      content = flow(n.kids, st, bullet: bullet);
+    }
+    if (gt) {
+      final g = _gradient(bgv ?? '');
+      if (g != null) {
+        content = ShaderMask(blendMode: BlendMode.srcIn, shaderCallback: (rc) => g.createShader(rc), child: content);
+      }
+    }
+    final anim = animKind(c, n);
+    if (anim == 'marquee' && n.tag != 'marquee') {
+      content = Marquee(plain: _plainOf(n), child: content);
+    } else if (anim != null && anim != 'marquee') {
+      content = AnimBox(kind: anim, plain: _plainOf(n), style: st.style(), ms: dur(c), child: content);
+    }
+    final pad = _insets(c['padding']);
+    final rad = _px(c['border-radius']);
+    Color? bc;
+    var bw = 1.0;
+    final bd = c['border'];
+    if (bd != null) {
+      bw = _px(bd) ?? 1.0;
+      for (final t in bd.split(RegExp(r'\s+(?![^(]*\))'))) {
+        final cc = parseCssColor(t);
+        if (cc != null) bc = cc;
+      }
+    }
+    Widget w = content;
+    if (bgColor != null || bgGrad != null || bc != null || pad != null) {
+      w = Container(
+        padding: pad ?? EdgeInsets.zero,
+        decoration: BoxDecoration(
+          color: bgColor,
+          gradient: bgGrad,
+          borderRadius: rad == null ? null : BorderRadius.circular(rad),
+          border: bc == null ? null : Border.all(color: bc, width: bw),
+        ),
+        child: content,
+      );
+    }
+    return Padding(
+      padding: _insets(c['margin']) ?? const EdgeInsets.only(bottom: 4),
+      child: SizedBox(width: double.infinity, child: w),
+    );
+  }
+}
+
+// Animations simples (aucun code du créateur n'est exécuté : seulement des effets prévus ici).
+class AnimBox extends StatefulWidget {
+  final String kind;
+  final Widget child;
+  final String plain;
+  final TextStyle style;
+  final int ms;
+  const AnimBox(
+      {super.key,
+      required this.kind,
+      required this.child,
+      required this.plain,
+      required this.style,
+      this.ms = 0});
+  @override
+  State<AnimBox> createState() => _AnimBoxState();
+}
+
+class _AnimBoxState extends State<AnimBox> with SingleTickerProviderStateMixin {
+  late final AnimationController c;
+  @override
+  void initState() {
+    super.initState();
+    final k = widget.kind;
+    final def = {
+      'blink': 1000, 'pulse': 800, 'fade': 1200, 'shake': 600, 'bounce': 800, 'glow': 1400,
+      'rainbow': 3000, 'wave': 1500, 'spin': 3000,
+    }[k];
+    final ms = widget.ms > 0 ? widget.ms : (def ?? (widget.plain.length * 110 + 600));
+    c = AnimationController(vsync: this, duration: Duration(milliseconds: ms));
+    if (k == 'pulse' || k == 'fade' || k == 'glow') {
+      c.repeat(reverse: true);
+    } else {
+      c.repeat();
+    }
+  }
+
+  @override
+  void dispose() {
+    c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final st = widget.style;
+    return AnimatedBuilder(
+      animation: c,
+      child: widget.child,
+      builder: (_, child) {
+        final t = c.value;
+        switch (widget.kind) {
+          case 'blink':
+            return Opacity(opacity: t < 0.5 ? 1 : 0.08, child: child);
+          case 'pulse':
+            return Transform.scale(scale: 1 + 0.12 * t, child: child);
+          case 'fade':
+            return Opacity(opacity: 0.2 + 0.8 * t, child: child);
+          case 'shake':
+            return Transform.translate(offset: Offset(sin(t * 2 * pi * 4) * 3, 0), child: child);
+          case 'bounce':
+            return Transform.translate(offset: Offset(0, -8 * sin(t * pi).abs()), child: child);
+          case 'spin':
+            return Transform.rotate(angle: t * 2 * pi, child: child);
+          case 'glow':
+            final col = (st.color ?? Colors.white);
+            return DecoratedBox(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(8),
+                boxShadow: [BoxShadow(color: col.withValues(alpha: 0.25 + 0.45 * t), blurRadius: 10 + 18 * t)],
+              ),
+              child: child,
+            );
+          case 'rainbow':
+            final chars = widget.plain.split('');
+            return Text.rich(TextSpan(children: [
+              for (var i = 0; i < chars.length; i++)
+                TextSpan(
+                    text: chars[i],
+                    style: st.copyWith(
+                        color: HSVColor.fromAHSV(1, (t * 360 + i * 22) % 360, 0.85, 1).toColor())),
+            ]));
+          case 'wave':
+            final chars = widget.plain.split('');
+            return Text.rich(TextSpan(children: [
+              for (var i = 0; i < chars.length; i++)
+                WidgetSpan(
+                    child: Transform.translate(
+                        offset: Offset(0, 5 * sin(t * 2 * pi + i * 0.6)),
+                        child: Text(chars[i], style: st))),
+            ]));
+          case 'typewriter':
+            final n = (t * (widget.plain.length + 4)).floor().clamp(0, widget.plain.length);
+            return Text(widget.plain.substring(0, n), style: st);
+          default:
+            return child ?? const SizedBox.shrink();
+        }
+      },
+    );
+  }
+}
+
+class Marquee extends StatefulWidget {
+  final Widget child;
+  final String plain;
+  const Marquee({super.key, required this.child, required this.plain});
+  @override
+  State<Marquee> createState() => _MarqueeState();
+}
+
+class _MarqueeState extends State<Marquee> with SingleTickerProviderStateMixin {
+  late final AnimationController c;
+  @override
+  void initState() {
+    super.initState();
+    c = AnimationController(vsync: this, duration: Duration(milliseconds: 6000 + widget.plain.length * 90))
+      ..repeat();
+  }
+
+  @override
+  void dispose() {
+    c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => ClipRect(
+        child: LayoutBuilder(builder: (ctx, bc) {
+          final w = bc.maxWidth.isFinite ? bc.maxWidth : 300.0;
+          final tw = widget.plain.length * 9.0;
+          return SizedBox(
+            height: 26,
+            child: AnimatedBuilder(
+              animation: c,
+              child: OverflowBox(
+                  alignment: Alignment.centerLeft,
+                  minWidth: 0,
+                  maxWidth: double.infinity,
+                  child: widget.child),
+              builder: (_, child) =>
+                  Transform.translate(offset: Offset(w - c.value * (w + tw), 0), child: child),
+            ),
+          );
+        }),
+      );
+}
+
+Widget _plainMsg(String t, double base, void Function(String)? onLink) {
+  final txt = decodeEntities(t);
+  final spans = <InlineSpan>[];
+  var last = 0;
+  for (final m in RegExp(r'(https?://[^\s<]+|\bt\.me/[^\s<]+)').allMatches(txt)) {
+    if (m.start > last) spans.add(TextSpan(text: txt.substring(last, m.start)));
+    final u = m.group(0)!;
+    final url = u.startsWith('http') ? u : 'https://$u';
+    final cb = onLink;
+    spans.add(TextSpan(
+      text: u,
+      style: const TextStyle(color: Color(0xFF64B5F6), decoration: TextDecoration.underline),
+      recognizer: cb == null ? null : (TapGestureRecognizer()..onTap = () => cb(url)),
+    ));
+    last = m.end;
+  }
+  if (last < txt.length) spans.add(TextSpan(text: txt.substring(last)));
+  return Text.rich(TextSpan(style: TextStyle(color: Colors.white, fontSize: base), children: spans));
+}
+
+// Affiche un message : texte simple ou HTML/CSS limité (couleurs, dégradés, animations, liens).
+Widget richMessage(String input, {double base = 14, void Function(String)? onLink}) {
+  final src = input.length > 8000 ? input.substring(0, 8000) : input;
+  var cleaned = src.replaceAll(RegExp(r'<!--[\s\S]*?-->'), '');
+  final sheet = <String, String>{};
+  final kf = <String, String>{};
+  for (final m
+      in RegExp(r'<style[^>]*>([\s\S]*?)</style\s*>', caseSensitive: false).allMatches(cleaned)) {
+    var css = m.group(1)!;
+    for (final k in RegExp(r'@keyframes\s+([\w-]+)\s*\{((?:[^{}]*\{[^{}]*\})*)\s*\}').allMatches(css)) {
+      kf[k.group(1)!.toLowerCase()] = k.group(2)!.toLowerCase();
+    }
+    css = css.replaceAll(RegExp(r'@keyframes\s+[\w-]+\s*\{(?:[^{}]*\{[^{}]*\})*\s*\}'), '');
+    for (final r in RegExp(r'([^{}]+)\{([^{}]*)\}').allMatches(css)) {
+      for (final sel in r.group(1)!.split(',')) {
+        final s = sel.trim().toLowerCase();
+        if (s.isEmpty || s.contains(' ') || s.contains(':') || s.contains('>') || s.startsWith('@')) continue;
+        sheet[s] = '${sheet[s] ?? ''};${r.group(2)}';
+      }
+    }
+  }
+  cleaned = cleaned.replaceAll(
+      RegExp(r'<(script|style|iframe|object|embed)[\s\S]*?</\1\s*>', caseSensitive: false), '');
+  if (!RegExp(r'<[a-zA-Z/]').hasMatch(cleaned)) return _plainMsg(cleaned, base, onLink);
+  try {
+    final root = _parseHtml(cleaned);
+    return _Render(sheet, kf, base, onLink).flow(root.kids, _TS(Colors.white, base));
   } catch (_) {
     return Text(decodeEntities(cleaned.replaceAll(RegExp(r'<[^>]*>'), '')),
         style: TextStyle(color: Colors.white, fontSize: base));
   }
+}
+
+// ---------- Tunnels DNS (SlowDNS / DNSTT) ----------
+const kDnsPort = 10811;
+const kResolvers = [
+  '8.8.8.8:53', '8.8.4.4:53', '1.1.1.1:53', '1.0.0.1:53', '9.9.9.9:53',
+  '208.67.222.222:53', '94.140.14.14:53', '223.5.5.5:53', '185.228.168.9:53', '76.76.2.0:53',
+];
+
+Uint8List dnsQuery(String name, int id) {
+  final b = BytesBuilder();
+  b.add([id >> 8, id & 255, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+  for (final label in name.split('.')) {
+    if (label.isEmpty) continue;
+    final lb = utf8.encode(label);
+    b.addByte(lb.length);
+    b.add(lb);
+  }
+  b.add([0, 0, 16, 0, 1]);
+  return b.toBytes();
+}
+
+// Temps de réponse (ms) d'un résolveur DNS en UDP, ou -1.
+Future<int> dnsProbe(String server, String domain) async {
+  final parts = server.trim().split(':');
+  final host = parts[0];
+  final port = parts.length > 1 ? (int.tryParse(parts[1]) ?? 53) : 53;
+  RawDatagramSocket? s;
+  try {
+    final addr = InternetAddress.tryParse(host);
+    if (addr == null) return -1;
+    s = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    final comp = Completer<int>();
+    final sw = Stopwatch()..start();
+    s.listen((e) {
+      if (e == RawSocketEvent.read) {
+        final d = s!.receive();
+        if (d != null && !comp.isCompleted) comp.complete(sw.elapsedMilliseconds);
+      }
+    });
+    final rnd = Random();
+    s.send(dnsQuery('${rnd.nextInt(99999)}.$domain', rnd.nextInt(65535)), addr, port);
+    return await comp.future.timeout(const Duration(seconds: 3));
+  } catch (_) {
+    return -1;
+  } finally {
+    s?.close();
+  }
+}
+
+String dnsXrayJson(Map<String, String> f) {
+  final viaSsh = (f['smethod'] ?? 'ssh') == 'ssh';
+  final server = <String, dynamic>{'address': '127.0.0.1', 'port': viaSsh ? kSshPort : kDnsPort};
+  final su = f['suser'] ?? '';
+  if (!viaSsh && su.isNotEmpty) {
+    server['users'] = [
+      {'user': su, 'pass': f['spass'] ?? ''}
+    ];
+  }
+  return jsonEncode(xrayBase({
+    'tag': 'proxy',
+    'protocol': 'socks',
+    'settings': {
+      'servers': [server]
+    }
+  }, tcpOnly: true));
+}
+
+List<String> dnsArgs(Map<String, String> f, String keyFile) {
+  final tr = f['transport'] ?? 'udp';
+  final rs = (f['resolver'] ?? '8.8.8.8:53').trim();
+  final a = <String>[];
+  if (tr == 'doh') {
+    a.addAll(['-doh', rs.startsWith('http') ? rs : 'https://$rs/dns-query']);
+  } else if (tr == 'dot') {
+    a.addAll(['-dot', rs.contains(':') ? rs : '$rs:853']);
+  } else {
+    a.addAll(['-udp', rs.contains(':') ? rs : '$rs:53']);
+  }
+  a.addAll(['-pubkey-file', keyFile, (f['domain'] ?? '').trim(), '127.0.0.1:$kDnsPort']);
+  return a;
 }
 
 // ---------- Chiffrement des fichiers .otaku ----------
@@ -1741,6 +2529,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   Map<String, String> skinNames = {};
   bool hotspot = false;
   SshTunnel? sshT;
+  Process? dnsProc;
   bool sshBusy = false;
   bool preResolve = true, autoHost = true;
   bool insecureDefault = true;
@@ -1967,6 +2756,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     if (l.startsWith('vless')) return 'VLESS';
     if (l.startsWith('vmess')) return 'VMess';
     if (l.startsWith('trojan')) return 'Trojan';
+    if (l.startsWith('dns')) return 'DNS';
     if (l.startsWith('ssh')) return 'SSH';
     if (l.startsWith('ss')) return 'Shadowsocks';
     return '?';
@@ -1993,6 +2783,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         }
         return Parsed('${j['remarks'] ?? j['remark'] ?? 'Config JSON'}', addr, () => raw);
       }
+      if (link.startsWith('dns://')) {
+        final f = parseLink(link);
+        if (f == null || (f['domain'] ?? '').isEmpty) return null;
+        final nm = (f['remark'] ?? '').isEmpty ? f['domain']! : f['remark']!;
+        return Parsed(nm, f['domain']!, () => dnsXrayJson(f));
+      }
       if (link.startsWith('ssh://')) {
         final f = parseLink(link);
         if (f == null || (f['add'] ?? '').isEmpty) return null;
@@ -2010,7 +2806,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   // téléphone, header host rempli, allowInsecure, Turbo, DNS et hotspot.
   Future<String> buildConfig(Parsed p, String link) async {
     final raw = p.full();
-    if (link.startsWith('xrayjson://') || link.startsWith('ssh://')) return raw;
+    if (link.startsWith('xrayjson://') || link.startsWith('ssh://') || link.startsWith('dns://')) return raw;
     try {
       final m = jsonDecode(raw) as Map<String, dynamic>;
       final lf = parseLink(link) ?? <String, String>{};
@@ -2100,6 +2896,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   }
 
   Future<int> _delay(int i) async {
+    if (configs[i].link.startsWith('dns://')) return _dnsProbeCfg(configs[i].link);
     if (configs[i].link.startsWith('ssh://')) return _sshProbe(configs[i].link);
     final p = parse(configs[i].link);
     if (p == null) return -1;
@@ -2153,9 +2950,10 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     }
     setStep(0, 2);
     log('Config lue : ${p.address}');
-    setStep(1, c.link.startsWith('ssh://') ? 1 : 4);
-    if (c.link.startsWith('ssh://')) {
-      final ok = await _startSsh(c);
+    final isTun = c.link.startsWith('ssh://') || c.link.startsWith('dns://');
+    setStep(1, isTun ? 1 : 4);
+    if (isTun) {
+      final ok = c.link.startsWith('dns://') ? await _startDns(c) : await _startSsh(c);
       setStep(1, ok ? 2 : 3);
       if (!ok) return;
       if (!wantOn) {
@@ -2218,6 +3016,11 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   Future<void> _stopSsh() async {
     final t = sshT;
     sshT = null;
+    final p = dnsProc;
+    dnsProc = null;
+    try {
+      p?.kill();
+    } catch (_) {}
     if (t != null) await t.stop();
   }
 
@@ -2809,6 +3612,149 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     return b.toString();
   }
 
+  Future<void> openLink(String url) async {
+    final u = url.trim();
+    if (!RegExp(r'^(https?://|tg://)', caseSensitive: false).hasMatch(u)) {
+      return snack('Lien non autorisé');
+    }
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Ouvrir ce lien ?'),
+        content: SelectableText(u),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Annuler')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(backgroundColor: kRed),
+            child: const Text('Ouvrir'),
+          ),
+        ],
+      ),
+    );
+    if (go != true) return;
+    try {
+      await launchUrl(Uri.parse(u), mode: LaunchMode.externalApplication);
+    } catch (_) {
+      snack('Impossible d\'ouvrir le lien');
+    }
+  }
+
+  Future<bool> _startDns(Cfg c) async {
+    final f = parseLink(c.link);
+    if (f == null) {
+      snack('Config DNS illisible');
+      return false;
+    }
+    setState(() => sshBusy = true);
+    SshTunnel? t;
+    try {
+      await _stopSsh();
+      var dir = '';
+      try {
+        dir = await kChan.invokeMethod<String>('nativeDir') ?? '';
+      } catch (_) {}
+      final bin = '$dir/libdnstt.so';
+      if (dir.isEmpty || !File(bin).existsSync()) {
+        throw 'le moteur DNS (dnstt) est absent de cet APK';
+      }
+      final tmp = await getTemporaryDirectory();
+      final kf = File('${tmp.path}/dnstt.pub');
+      await kf.writeAsString('${(f['pubkey'] ?? '').trim()}\n');
+      log('dnstt : lancement (${f['transport']} ${f['resolver']})');
+      final p = await Process.start(bin, dnsArgs(f, kf.path),
+          environment: {'SSL_CERT_DIR': '/system/etc/security/cacerts'});
+      dnsProc = p;
+      p.stderr.transform(utf8.decoder).listen((s) {
+        for (final l in s.split('\n')) {
+          if (l.trim().isNotEmpty) log('dnstt : ${l.trim()}');
+        }
+      });
+      p.stdout.transform(utf8.decoder).listen((_) {});
+      p.exitCode.then((code) {
+        if (dnsProc == p) {
+          log('dnstt : arrêté (code $code)');
+          if (connected || busy) v2ray.stopV2Ray();
+        }
+      });
+      var ready = false;
+      for (var k = 0; k < 40; k++) {
+        await Future.delayed(const Duration(milliseconds: 500));
+        try {
+          final s = await Socket.connect('127.0.0.1', kDnsPort, timeout: const Duration(seconds: 1));
+          s.destroy();
+          ready = true;
+          break;
+        } catch (_) {}
+      }
+      if (!ready) throw 'le tunnel DNS ne démarre pas (clé, domaine ou résolveur à revoir)';
+      log('dnstt : port local prêt');
+      if ((f['smethod'] ?? 'ssh') == 'ssh') {
+        final sf = <String, String>{
+          'add': '127.0.0.1',
+          'port': '$kDnsPort',
+          'user': f['user'] ?? '',
+          'id': f['id'] ?? '',
+          'mode': 'direct',
+        };
+        t = SshTunnel();
+        t.onClosed = () {
+          if (!mounted) return;
+          log('SSH : connexion fermée');
+          if (connected || busy) v2ray.stopV2Ray();
+        };
+        await t.start(sf, log, authSecs: 90).timeout(const Duration(seconds: 120));
+        sshT = t;
+      }
+      return true;
+    } catch (e) {
+      log('DNS : échec : $e');
+      snack('Tunnel DNS impossible : ${_short(e)}');
+      try {
+        await t?.stop();
+      } catch (_) {}
+      await _stopSsh();
+      wantOn = false;
+      return false;
+    } finally {
+      if (mounted) setState(() => sshBusy = false);
+    }
+  }
+
+  Future<int> _dnsProbeCfg(String link) async {
+    final f = parseLink(link);
+    if (f == null) return -1;
+    final rs = f['resolver'] ?? '';
+    if (rs.startsWith('http') || (f['transport'] ?? 'udp') != 'udp') return -1;
+    return dnsProbe(rs, f['domain'] ?? '');
+  }
+
+  Future<String> _dnsReport(Cfg c) async {
+    final f = parseLink(c.link);
+    if (f == null) return 'Config DNS illisible.';
+    final b = StringBuffer();
+    b.writeln('Protocole : tunnel DNS (dnstt / SlowDNS)');
+    b.writeln('Domaine : ${f['domain']}');
+    b.writeln('Résolveur : ${f['resolver']} (${f['transport']})   Méthode : ${f['smethod']}');
+    final key = f['pubkey'] ?? '';
+    b.writeln('Clé publique : ${RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(key) ? 'format OK' : 'FORMAT INVALIDE'}');
+    var dir = '';
+    try {
+      dir = await kChan.invokeMethod<String>('nativeDir') ?? '';
+    } catch (_) {}
+    final has = dir.isNotEmpty && File('$dir/libdnstt.so').existsSync();
+    b.writeln('Moteur dnstt : ${has ? 'présent' : 'ABSENT de cet APK'}');
+    if ((f['transport'] ?? 'udp') == 'udp' && !(f['resolver'] ?? '').startsWith('http')) {
+      final ms = await dnsProbe(f['resolver'] ?? '', f['domain'] ?? '');
+      b.writeln('Résolveur : ${ms >= 0 ? 'répond en $ms ms' : 'ne répond pas'}');
+    }
+    b.writeln('');
+    b.writeln(has
+        ? '=> Prêt. Connecte-toi : le journal affichera les lignes « dnstt : ... ».'
+        : '=> Le moteur DNS n\'est pas dans l\'APK : relance la fabrication sur GitHub (version 6.3).');
+    return b.toString();
+  }
+
   Future<int> _sshProbe(String link) async {
     final f = parseLink(link);
     if (f == null) return -1;
@@ -2930,7 +3876,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ]),
       ),
     );
-    final report = c.link.startsWith('ssh://')
+    final report = c.link.startsWith('dns://')
+        ? await _dnsReport(c)
+        : c.link.startsWith('ssh://')
         ? await _sshReport(c)
         : (await _diagReport(c, i)) + (await _coreReport(c)) + (await _nativeReport());
     if (!mounted) return;
@@ -3672,7 +4620,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(title),
-        content: SingleChildScrollView(child: richMessage(fillVars(html, msgVars()))),
+        content: SingleChildScrollView(child: richMessage(fillVars(html, msgVars()), onLink: openLink)),
         actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
       ),
     );
@@ -3930,7 +4878,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           if (c.msg.trim().isEmpty)
             Text('Aucun message pour cette config.', style: small)
           else
-            richMessage(fillVars(c.msg, vars)),
+            richMessage(fillVars(c.msg, vars), onLink: openLink),
           const SizedBox(height: 12),
           const Text('Message de connexion', style: TextStyle(color: kRed, fontSize: 12)),
           const SizedBox(height: 4),
@@ -3939,7 +4887,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           else if (!trafficOk)
             Text('Il s\'affichera quand le trafic passera.', style: small)
           else
-            richMessage(fillVars(c.cmsg, vars)),
+            richMessage(fillVars(c.cmsg, vars), onLink: openLink),
         ],
       ]),
       journalCard('Journal en direct', Icons.article_outlined, [
@@ -4409,7 +5357,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v6.2'),
+          title: Text('OTAKU TUNNEL v6.3'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);

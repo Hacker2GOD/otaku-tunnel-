@@ -41,6 +41,7 @@ dependencies:
   file_selector: ^1.1.0
   cryptography: ^2.9.0
   dartssh2: ^4.1.0
+  url_launcher: ^6.3.3
 
 dev_dependencies:
   flutter_test:

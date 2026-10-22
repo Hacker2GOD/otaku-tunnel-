@@ -63,6 +63,9 @@ class MainActivity : FlutterActivity() {
                     }
                     result.success(sb.toString())
                 }
+                "nativeDir" -> {
+                    result.success(applicationInfo.nativeLibraryDir)
+                }
                 else -> result.notImplemented()
             }
         }
