@@ -22,28 +22,6 @@
   "color": 4294916134
  },
  {
-  "id": "c03",
-  "name": "Nami",
-  "file": "assets/chars/c03.jpg",
-  "w": 736,
-  "h": 1307,
-  "ex": 0.5095,
-  "ey": 0.3366,
-  "es": 0.4076,
-  "color": 4294925350
- },
- {
-  "id": "c04",
-  "name": "Luffy Gear 5",
-  "file": "assets/chars/c04.jpg",
-  "w": 736,
-  "h": 1307,
-  "ex": 0.5326,
-  "ey": 0.3803,
-  "es": 0.4076,
-  "color": 4294925350
- },
- {
   "id": "c05",
   "name": "Godwin Awake",
   "file": "assets/chars/c05.jpg",
@@ -53,17 +31,6 @@
   "ey": 0.3045,
   "es": 0.6265,
   "color": 4280704255
- },
- {
-  "id": "c06",
-  "name": "Tanjiro",
-  "file": "assets/chars/c06.jpg",
-  "w": 709,
-  "h": 1260,
-  "ex": 0.5642,
-  "ey": 0.2103,
-  "es": 0.3526,
-  "color": 4280722687
  },
  {
   "id": "c07",
@@ -77,127 +44,6 @@
   "color": 4288947967
  },
  {
-  "id": "c08",
-  "name": "Tanjiro Lakers",
-  "file": "assets/chars/c08.jpg",
-  "w": 717,
-  "h": 1280,
-  "ex": 0.4603,
-  "ey": 0.1602,
-  "es": 0.4184,
-  "color": 4294952998
- },
- {
-  "id": "c09",
-  "name": "Zenitsu Lakers",
-  "file": "assets/chars/c09.jpg",
-  "w": 717,
-  "h": 1280,
-  "ex": 0.5718,
-  "ey": 0.1367,
-  "es": 0.3626,
-  "color": 4294934566
- },
- {
-  "id": "c10",
-  "name": "Rengoku",
-  "file": "assets/chars/c10.jpg",
-  "w": 736,
-  "h": 1593,
-  "ex": 0.4823,
-  "ey": 0.408,
-  "es": 0.231,
-  "color": 4280713471
- },
- {
-  "id": "c11",
-  "name": "Sukuna",
-  "file": "assets/chars/c11.jpg",
-  "w": 736,
-  "h": 1313,
-  "ex": 0.5231,
-  "ey": 0.3123,
-  "es": 0.3804,
-  "color": 4294916134
- },
- {
-  "id": "c12",
-  "name": "Goku Ultra Instinct",
-  "file": "assets/chars/c12.jpg",
-  "w": 379,
-  "h": 527,
-  "ex": 0.5013,
-  "ey": 0.3529,
-  "es": 0.343,
-  "color": 4280704255
- },
- {
-  "id": "c13",
-  "name": "Isagi",
-  "file": "assets/chars/c13.jpg",
-  "w": 415,
-  "h": 739,
-  "ex": 0.4458,
-  "ey": 0.3275,
-  "es": 0.3614,
-  "color": 4280722687
- },
- {
-  "id": "c14",
-  "name": "Sung Jinwoo",
-  "file": "assets/chars/c14.jpg",
-  "w": 597,
-  "h": 335,
-  "ex": 0.4891,
-  "ey": 0.3522,
-  "es": 0.1508,
-  "color": 4294911544
- },
- {
-  "id": "c15",
-  "name": "Asta",
-  "file": "assets/chars/c15.jpg",
-  "w": 373,
-  "h": 740,
-  "ex": 0.622,
-  "ey": 0.2486,
-  "es": 0.2681,
-  "color": 4293666559
- },
- {
-  "id": "c16",
-  "name": "Skin 16",
-  "file": "assets/chars/c16.jpg",
-  "w": 236,
-  "h": 420,
-  "ex": 0.4025,
-  "ey": 0.1548,
-  "es": 0.3814,
-  "color": 4294911544
- },
- {
-  "id": "c17",
-  "name": "Escanor",
-  "file": "assets/chars/c17.jpg",
-  "w": 414,
-  "h": 740,
-  "ex": 0.4589,
-  "ey": 0.4689,
-  "es": 0.2899,
-  "color": 4294934566
- },
- {
-  "id": "c18",
-  "name": "Goku Maîtrisé",
-  "file": "assets/chars/c18.jpg",
-  "w": 597,
-  "h": 335,
-  "ex": 0.4891,
-  "ey": 0.3224,
-  "es": 0.2513,
-  "color": 4280704255
- },
- {
   "id": "c19",
   "name": "Godwin Or",
   "file": "assets/chars/c19.jpg",
@@ -207,16 +53,5 @@
   "ey": 0.2532,
   "es": 0.3165,
   "color": 4294925350
- },
- {
-  "id": "c20",
-  "name": "Blue Lock",
-  "file": "assets/chars/c20.jpg",
-  "w": 850,
-  "h": 1607,
-  "ex": 0.4647,
-  "ey": 0.168,
-  "es": 0.2,
-  "color": 4280731903
  }
 ]

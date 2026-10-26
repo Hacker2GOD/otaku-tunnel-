@@ -1,4 +1,3 @@
-import 'package:flutter/gestures.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -9,7 +8,9 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:dartssh2/dartssh2.dart' as ssh;
 import 'package:cryptography/cryptography.dart' as cr;
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_v2ray/flutter_v2ray.dart';
 import 'package:path_provider/path_provider.dart';
@@ -20,7 +21,19 @@ const kRed = Color(0xFFE53935);
 const kBg = Color(0xFF0A0A0F);
 const kCard = Color(0xFF16161F);
 
-void main() => runApp(const OtakuApp());
+// Identifiants de TEST Google : remplace-les par les tiens (voir le guide de publication).
+const kAdsOn = true;
+const kInterstitialId = 'ca-app-pub-3940256099942544/1033173712';
+const kBannerId = 'ca-app-pub-3940256099942544/6300978111';
+const kPrivacyUrl = 'https://hacker2god.github.io/otaku-tunnel-privacy/';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await MobileAds.instance.initialize();
+  } catch (_) {}
+  runApp(const OtakuApp());
+}
 
 class OtakuApp extends StatelessWidget {
   const OtakuApp({super.key});
@@ -266,12 +279,35 @@ class CharBackground extends StatelessWidget {
 
 // Créateur de skin : choisis ta photo, place le cercle sur l'œil, donne un nom.
 class SkinMaker extends StatefulWidget {
-  const SkinMaker({super.key});
+  final Skin? edit;
+  const SkinMaker({super.key, this.edit});
   @override
   State<SkinMaker> createState() => _SkinMakerState();
 }
 
 class _SkinMakerState extends State<SkinMaker> {
+  bool newPic = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final e = widget.edit;
+    if (e != null) {
+      ex = e.ex;
+      ey = e.ey;
+      es = e.es;
+      color = e.color;
+      autoColor = e.color;
+      iw = e.w;
+      ih = e.h;
+      name.text = e.name;
+      ext = e.file.contains('.') ? e.file.split('.').last : 'jpg';
+      File(e.file).readAsBytes().then((b) {
+        if (mounted) setState(() => bytes = b);
+      });
+    }
+  }
+
   Uint8List? bytes;
   String ext = 'jpg';
   int iw = 0, ih = 0;
@@ -326,6 +362,7 @@ class _SkinMakerState extends State<SkinMaker> {
       if (!mounted) return;
       setState(() {
         bytes = b;
+        newPic = true;
         iw = w;
         ih = h;
         ext = e.isEmpty ? 'jpg' : e;
@@ -349,13 +386,24 @@ class _SkinMakerState extends State<SkinMaker> {
     if (b == null || iw == 0) return _msg('Choisis d\'abord une photo');
     setState(() => busy = true);
     try {
+      final old = widget.edit;
+      final n = name.text.trim().isEmpty ? 'Mon skin' : name.text.trim();
+      if (old != null && !newPic) {
+        if (!mounted) return;
+        Navigator.pop(context, Skin(old.id, n, old.file, false, old.w, old.h, ex, ey, es, color));
+        return;
+      }
       final dir = await getApplicationDocumentsDirectory();
       final sd = Directory('${dir.path}/skins');
       if (!sd.existsSync()) sd.createSync(recursive: true);
-      final id = 'u${DateTime.now().millisecondsSinceEpoch}';
+      final id = old?.id ?? 'u${DateTime.now().millisecondsSinceEpoch}';
       final path = '${sd.path}/$id.$ext';
       await File(path).writeAsBytes(b);
-      final n = name.text.trim().isEmpty ? 'Mon skin' : name.text.trim();
+      if (old != null && old.file != path) {
+        try {
+          File(old.file).deleteSync();
+        } catch (_) {}
+      }
       if (!mounted) return;
       Navigator.pop(context, Skin(id, n, path, false, iw, ih, ex, ey, es, color));
     } catch (_) {
@@ -375,7 +423,7 @@ class _SkinMakerState extends State<SkinMaker> {
     }
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Créer un skin'),
+        title: Text(widget.edit == null ? 'Créer un skin' : 'Modifier le skin'),
         actions: [TextButton(onPressed: busy ? null : save, child: const Text('Enregistrer'))],
       ),
       body: ListView(padding: const EdgeInsets.all(16), children: [
@@ -2524,12 +2572,15 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   bool autoConnect = false, mangekyoColor = true;
   String dns = 'auto';
   String excluded = '';
-  String skinId = 'classic';
+  String skinId = 'c07';
   List<Skin> skins = [];
   Map<String, String> skinNames = {};
   bool hotspot = false;
   SshTunnel? sshT;
   Process? dnsProc;
+  BannerAd? banner;
+  bool bannerOk = false;
+  DateTime? lastAd;
   bool sshBusy = false;
   bool preResolve = true, autoHost = true;
   bool insecureDefault = true;
@@ -2623,6 +2674,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     }
     if (now == 'DISCONNECTED') {
       trafficOk = false;
+      banner?.dispose();
+      banner = null;
+      bannerOk = false;
       if (stepSt[2] != 3) {
         stepSt = List<int>.filled(kSteps.length, 0);
         logTick.value++;
@@ -2688,7 +2742,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       autoConnect = p.getBool('autoConnect') ?? false;
       mangekyoColor = p.getBool('mangekyoColor') ?? true;
       excluded = p.getString('excluded') ?? '';
-      skinId = p.getString('skinId') ?? 'classic';
+      skinId = p.getString('skinId') ?? 'c07';
       hotspot = p.getBool('hotspot') ?? false;
       preResolve = p.getBool('preResolve') ?? true;
       autoHost = p.getBool('autoHost') ?? true;
@@ -4163,9 +4217,19 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
               onTap: () => Navigator.pop(ctx, 'rename')),
           if (!k.asset)
             ListTile(
+                leading: const Icon(Icons.tune),
+                title: const Text('Modifier (œil, taille, couleur, photo)'),
+                onTap: () => Navigator.pop(ctx, 'edit')),
+          if (!k.asset)
+            ListTile(
                 leading: const Icon(Icons.delete_outline),
                 title: const Text('Supprimer'),
-                onTap: () => Navigator.pop(ctx, 'del')),
+                onTap: () => Navigator.pop(ctx, 'del'))
+          else
+            const ListTile(
+                enabled: false,
+                leading: Icon(Icons.lock_outline),
+                title: Text('Skin par défaut : ne peut pas être supprimé')),
         ]),
       ),
     );
@@ -4177,6 +4241,18 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           if (k.asset) skinNames[k.id] = k.name;
         });
         _saveSkins();
+      }
+    } else if (v == 'edit') {
+      final r = await Navigator.push<Skin>(
+          context, MaterialPageRoute(builder: (_) => SkinMaker(edit: k)));
+      if (r != null) {
+        setState(() {
+          final i = skins.indexWhere((x) => x.id == k.id);
+          if (i >= 0) skins[i] = r;
+        });
+        imageCache.clear();
+        imageCache.clearLiveImages();
+        await _saveSkins();
       }
     } else if (v == 'del') {
       try {
@@ -4582,6 +4658,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   @override
   void dispose() {
     _ipTimer?.cancel();
+    banner?.dispose();
     spin.dispose();
     super.dispose();
   }
@@ -4744,6 +4821,59 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   }
 
   // Après « Connecté » : on vérifie que le trafic passe vraiment (recherche d'IP à travers le tunnel).
+  Widget bannerBox() => Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Center(
+          child: SizedBox(
+            width: banner!.size.width.toDouble(),
+            height: banner!.size.height.toDouble(),
+            child: AdWidget(ad: banner!),
+          ),
+        ),
+      );
+
+  // Publicité affichée une fois la connexion vérifiée (trafic OK), pas plus d'une fois toutes les 3 minutes.
+  void _connectAds() {
+    if (!kAdsOn || !mounted) return;
+    final now = DateTime.now();
+    if (lastAd != null && now.difference(lastAd!).inMinutes < 3) return;
+    lastAd = now;
+    InterstitialAd.load(
+      adUnitId: kInterstitialId,
+      request: const AdRequest(),
+      adLoadCallback: InterstitialAdLoadCallback(
+        onAdLoaded: (ad) {
+          if (!mounted || !connected) {
+            ad.dispose();
+            return;
+          }
+          ad.fullScreenContentCallback = FullScreenContentCallback(
+            onAdDismissedFullScreenContent: (a) => a.dispose(),
+            onAdFailedToShowFullScreenContent: (a, e) => a.dispose(),
+          );
+          ad.show();
+          log('Pub affichée');
+        },
+        onAdFailedToLoad: (e) => log('Pub : non chargée (code ${e.code})'),
+      ),
+    );
+    banner?.dispose();
+    bannerOk = false;
+    final b = BannerAd(
+      adUnitId: kBannerId,
+      size: AdSize.banner,
+      request: const AdRequest(),
+      listener: BannerAdListener(
+        onAdLoaded: (_) {
+          if (mounted) setState(() => bannerOk = true);
+        },
+        onAdFailedToLoad: (ad, e) => ad.dispose(),
+      ),
+    );
+    banner = b;
+    b.load();
+  }
+
   Future<void> _afterConnected() async {
     setStep(3, 1);
     for (var k = 0; k < 4 && connected; k++) {
@@ -4755,6 +4885,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         setStep(3, 2);
         setStep(4, 2);
         log('Trafic OK : IP ${r.ip} (${r.country})');
+        _connectAds();
         if (mounted) {
           final c = configs.isEmpty ? null : configs[sel];
           if (c != null && c.cmsg.trim().isNotEmpty) {
@@ -4890,6 +5021,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             richMessage(fillVars(c.cmsg, vars), onLink: openLink),
         ],
       ]),
+      if (bannerOk && banner != null) bannerBox(),
       journalCard('Journal en direct', Icons.article_outlined, [
         Wrap(spacing: 6, children: [
           TextButton.icon(
@@ -4943,14 +5075,14 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final p = c == null ? null : parse(c.link);
     final cs = curSkin;
     final statusText = connected
-        ? (cs != null ? 'Aura activée' : 'Mangekyō activé')
+        ? (cs != null ? 'Aura activée' : 'Connexion active')
         : sshBusy
             ? 'Connexion SSH...'
             : searching
             ? 'Recherche du meilleur serveur...'
             : busy
                 ? 'Activation...'
-                : 'Touche le Sharingan';
+                : 'Touche l\'œil';
     return Stack(children: [
       if (cs != null)
         Positioned.fill(
@@ -5071,6 +5203,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           ),
         ]),
       ),
+      if (bannerOk && banner != null) bannerBox(),
       const SizedBox(height: 24),
       const Center(
           child: Text('Créé par APPOH GODWIN — HACKER GODWIN',
@@ -5270,12 +5403,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           onTap: killSwitchInfo,
         ),
         sec('Apparence'),
-        sw('Mangekyō selon le serveur', 'Une couleur différente par config', mangekyoColor,
+        sw('Couleur de l\'œil selon le serveur', 'Une couleur différente par config', mangekyoColor,
             (v) => mangekyoColor = v),
         ListTile(
           leading: const Icon(Icons.remove_red_eye),
           title: const Text('Skin : œil + photo du personnage'),
-          subtitle: Text(curSkin?.name ?? 'Classique (Sharingan puis Mangekyō)'),
+          subtitle: Text(curSkin?.name ?? 'Classique'),
           onTap: skinDialog,
         ),
         sec('Abonnements'),
@@ -5337,6 +5470,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             copyCode(configs);
           },
         ),
+        sec('À propos'),
+        ListTile(
+          leading: const Icon(Icons.privacy_tip_outlined),
+          title: const Text('Politique de confidentialité'),
+          onTap: () => openLink(kPrivacyUrl),
+        ),
         sec('Diagnostic'),
         ListTile(
           leading: const Icon(Icons.settings_ethernet),
@@ -5357,7 +5496,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v6.3'),
+          title: Text('OTAKU TUNNEL v7.0'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
