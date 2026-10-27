@@ -10,12 +10,16 @@ import 'package:cryptography/cryptography.dart' as cr;
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_v2ray/flutter_v2ray.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+// Pubs désactivées (version de test)
+class BannerAd {
+  void dispose() {}
+}
 
 const kRed = Color(0xFFE53935);
 const kBg = Color(0xFF0A0A0F);
@@ -29,9 +33,6 @@ const kPrivacyUrl = 'https://hacker2god.github.io/otaku-tunnel-privacy/';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  try {
-    await MobileAds.instance.initialize();
-  } catch (_) {}
   runApp(const OtakuApp());
 }
 
@@ -4821,58 +4822,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   }
 
   // Après « Connecté » : on vérifie que le trafic passe vraiment (recherche d'IP à travers le tunnel).
-  Widget bannerBox() => Padding(
-        padding: const EdgeInsets.only(bottom: 12),
-        child: Center(
-          child: SizedBox(
-            width: banner!.size.width.toDouble(),
-            height: banner!.size.height.toDouble(),
-            child: AdWidget(ad: banner!),
-          ),
-        ),
-      );
+  Widget bannerBox() => const SizedBox.shrink();
 
-  // Publicité affichée une fois la connexion vérifiée (trafic OK), pas plus d'une fois toutes les 3 minutes.
-  void _connectAds() {
-    if (!kAdsOn || !mounted) return;
-    final now = DateTime.now();
-    if (lastAd != null && now.difference(lastAd!).inMinutes < 3) return;
-    lastAd = now;
-    InterstitialAd.load(
-      adUnitId: kInterstitialId,
-      request: const AdRequest(),
-      adLoadCallback: InterstitialAdLoadCallback(
-        onAdLoaded: (ad) {
-          if (!mounted || !connected) {
-            ad.dispose();
-            return;
-          }
-          ad.fullScreenContentCallback = FullScreenContentCallback(
-            onAdDismissedFullScreenContent: (a) => a.dispose(),
-            onAdFailedToShowFullScreenContent: (a, e) => a.dispose(),
-          );
-          ad.show();
-          log('Pub affichée');
-        },
-        onAdFailedToLoad: (e) => log('Pub : non chargée (code ${e.code})'),
-      ),
-    );
-    banner?.dispose();
-    bannerOk = false;
-    final b = BannerAd(
-      adUnitId: kBannerId,
-      size: AdSize.banner,
-      request: const AdRequest(),
-      listener: BannerAdListener(
-        onAdLoaded: (_) {
-          if (mounted) setState(() => bannerOk = true);
-        },
-        onAdFailedToLoad: (ad, e) => ad.dispose(),
-      ),
-    );
-    banner = b;
-    b.load();
-  }
+  void _connectAds() {}
 
   Future<void> _afterConnected() async {
     setStep(3, 1);
