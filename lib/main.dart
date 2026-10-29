@@ -10,25 +10,17 @@ import 'package:cryptography/cryptography.dart' as cr;
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'ads.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_v2ray/flutter_v2ray.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-// Pubs désactivées (version de test)
-class BannerAd {
-  void dispose() {}
-}
-
 const kRed = Color(0xFFE53935);
 const kBg = Color(0xFF0A0A0F);
 const kCard = Color(0xFF16161F);
 
-// Identifiants de TEST Google : remplace-les par les tiens (voir le guide de publication).
-const kAdsOn = true;
-const kInterstitialId = 'ca-app-pub-3940256099942544/1033173712';
-const kBannerId = 'ca-app-pub-3940256099942544/6300978111';
 const kPrivacyUrl = 'https://hacker2god.github.io/otaku-tunnel-privacy/';
 
 Future<void> main() async {
@@ -2579,9 +2571,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   bool hotspot = false;
   SshTunnel? sshT;
   Process? dnsProc;
-  BannerAd? banner;
-  bool bannerOk = false;
-  DateTime? lastAd;
+  bool hunting = false, huntBusy = false;
+  int huntSecs = 5;
+  String huntTarget = '', huntStatus = 'Arrêté';
+  Timer? _huntTimer;
+  final List<IpInfo> huntHist = [];
+  final TextEditingController huntCtl = TextEditingController();
   bool sshBusy = false;
   bool preResolve = true, autoHost = true;
   bool insecureDefault = true;
@@ -2675,9 +2670,6 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     }
     if (now == 'DISCONNECTED') {
       trafficOk = false;
-      banner?.dispose();
-      banner = null;
-      bannerOk = false;
       if (stepSt[2] != 3) {
         stepSt = List<int>.filled(kSteps.length, 0);
         logTick.value++;
@@ -4297,10 +4289,25 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(fontSize: 10)),
+                if (k != null)
+                  InkWell(
+                    onTap: () async {
+                      await skinMenu(k);
+                      setD(() {});
+                    },
+                    child: const Padding(
+                      padding: EdgeInsets.all(2),
+                      child: Icon(Icons.more_horiz, size: 20, color: Colors.white70),
+                    ),
+                  ),
               ]),
             );
         return AlertDialog(
-          title: const Text('Skins'),
+          title: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Skins'),
+            Text('Touche ⋯ sous un skin pour le modifier ou le supprimer',
+                style: TextStyle(fontSize: 11, color: Colors.white54)),
+          ]),
           content: SizedBox(
             width: double.maxFinite,
             height: 420,
@@ -4308,7 +4315,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
               crossAxisCount: 4,
               mainAxisSpacing: 8,
               crossAxisSpacing: 8,
-              childAspectRatio: 0.78,
+              childAspectRatio: 0.66,
               children: [
                 tile('classic', 'Classique',
                     ClipOval(child: Image.asset('assets/images/mangekyo.png', width: 64, height: 64))),
@@ -4659,7 +4666,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   @override
   void dispose() {
     _ipTimer?.cancel();
-    banner?.dispose();
+    _huntTimer?.cancel();
     spin.dispose();
     super.dispose();
   }
@@ -4822,9 +4829,148 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   }
 
   // Après « Connecté » : on vérifie que le trafic passe vraiment (recherche d'IP à travers le tunnel).
-  Widget bannerBox() => const SizedBox.shrink();
+  // ----- Chasseur d'IP : mode avion / données mobiles -----
+  String _hms(DateTime d) =>
+      '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}:${d.second.toString().padLeft(2, '0')}';
 
-  void _connectAds() {}
+  Future<String?> _quickIp() async {
+    for (final u in const ['https://api.ipify.org?format=json', 'https://ipv4.icanhazip.com']) {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 4);
+      try {
+        final req = await client.getUrl(Uri.parse(u)).timeout(const Duration(seconds: 4));
+        final res = await req.close().timeout(const Duration(seconds: 4));
+        if (res.statusCode != 200) continue;
+        final body = (await res.transform(utf8.decoder).join().timeout(const Duration(seconds: 4))).trim();
+        final ip = body.startsWith('{') ? '${(jsonDecode(body) as Map)['ip'] ?? ''}' : body;
+        if (RegExp(r'^[0-9a-fA-F:.]{3,45}$').hasMatch(ip)) return ip;
+      } catch (_) {
+      } finally {
+        client.close(force: true);
+      }
+    }
+    return null;
+  }
+
+  Future<IpInfo> _lookupFor(String ip) async {
+    for (final u in [
+      'https://ipwho.is/$ip',
+      'http://ip-api.com/json/$ip?fields=status,country,countryCode,regionName,city,isp,query,timezone',
+    ]) {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+      try {
+        final req = await client.getUrl(Uri.parse(u)).timeout(const Duration(seconds: 6));
+        final res = await req.close().timeout(const Duration(seconds: 6));
+        if (res.statusCode != 200) continue;
+        final body = await res.transform(utf8.decoder).join().timeout(const Duration(seconds: 6));
+        final j = jsonDecode(body) as Map<String, dynamic>;
+        String s(dynamic v) => v == null ? '' : '$v';
+        final conn = j['connection'];
+        final tzv = j['timezone'];
+        if (j['success'] == false || j['status'] == 'fail') continue;
+        return IpInfo(
+          ip,
+          s(j['country_name'] ?? j['country']),
+          s(j['country_code'] ?? j['countryCode']),
+          s(j['city']),
+          s(j['region'] ?? j['regionName']),
+          s(conn is Map ? conn['isp'] : (j['isp'] ?? j['org'])),
+          s(tzv is Map ? tzv['id'] : tzv),
+          DateTime.now(),
+        );
+      } catch (_) {
+      } finally {
+        client.close(force: true);
+      }
+    }
+    return IpInfo(ip, '', '', '', '', '', '', DateTime.now());
+  }
+
+  bool _huntMatch(IpInfo i) {
+    final toks = huntTarget
+        .split(RegExp(r'[,;\s]+'))
+        .map((e) => e.trim().toLowerCase())
+        .where((e) => e.isNotEmpty)
+        .toList();
+    for (final t in toks) {
+      if (i.ip.toLowerCase().startsWith(t) ||
+          i.cc.toLowerCase() == t ||
+          i.country.toLowerCase().contains(t) ||
+          i.city.toLowerCase().contains(t) ||
+          i.isp.toLowerCase().contains(t)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void toggleHunt(bool on) {
+    _huntTimer?.cancel();
+    setState(() {
+      hunting = on;
+      huntStatus = on ? 'Chasse en cours...' : 'Arrêté';
+    });
+    if (on) {
+      _huntTimer = Timer.periodic(Duration(seconds: huntSecs), (_) => _huntTick());
+      _huntTick();
+    }
+  }
+
+  Future<void> _huntTick() async {
+    if (huntBusy || !hunting) return;
+    huntBusy = true;
+    try {
+      final ip = await _quickIp();
+      if (!mounted || !hunting) return;
+      if (ip == null) {
+        setState(() => huntStatus = 'Pas de réseau (mode avion ?)');
+        return;
+      }
+      if (huntHist.isNotEmpty && huntHist.first.ip == ip) {
+        setState(() => huntStatus = 'Même IP : $ip');
+        return;
+      }
+      setState(() => huntStatus = 'Nouvelle IP : $ip');
+      final info = await _lookupFor(ip);
+      if (!mounted) return;
+      setState(() {
+        huntHist.insert(0, info);
+        if (huntHist.length > 60) huntHist.removeLast();
+      });
+      log('Chasseur : nouvelle IP $ip (${info.country})');
+      if (_huntMatch(info)) {
+        _huntTimer?.cancel();
+        setState(() {
+          hunting = false;
+          huntStatus = 'IP trouvée : $ip';
+        });
+        HapticFeedback.heavyImpact();
+        showDialog(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('IP trouvée !'),
+            content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              SelectableText(ip, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 6),
+              Text('${info.city.isEmpty ? '' : '${info.city}, '}${info.country}'),
+              if (info.isp.isNotEmpty) Text(info.isp),
+            ]),
+            actions: [
+              TextButton(
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: ip));
+                  snack('IP copiée');
+                },
+                child: const Text('Copier'),
+              ),
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fermer')),
+            ],
+          ),
+        );
+      }
+    } finally {
+      huntBusy = false;
+    }
+  }
 
   Future<void> _afterConnected() async {
     setStep(3, 1);
@@ -4837,7 +4983,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         setStep(3, 2);
         setStep(4, 2);
         log('Trafic OK : IP ${r.ip} (${r.country})');
-        _connectAds();
+        adsAfterConnect(() => mounted && connected, log);
         if (mounted) {
           final c = configs.isEmpty ? null : configs[sel];
           if (c != null && c.cmsg.trim().isNotEmpty) {
@@ -4945,6 +5091,85 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         Text('Position approximative d\'après l\'adresse IP, donnée par un service en ligne.',
             style: small),
       ]),
+      journalCard('Chasseur d\'IP', Icons.radar, [
+        Text(
+            'Active le mode avion puis désactive-le (ou coupe et réactive les données mobiles) : '
+            'une nouvelle IP apparaît ici. Coupe le VPN pour voir l\'IP de ton opérateur.',
+            style: small),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Chasse active'),
+          subtitle: Text(huntStatus),
+          value: hunting,
+          onChanged: toggleHunt,
+        ),
+        Row(children: [
+          const Text('Vérifier toutes les'),
+          const SizedBox(width: 10),
+          DropdownButton<int>(
+            value: huntSecs,
+            items: const [
+              DropdownMenuItem(value: 3, child: Text('3 s')),
+              DropdownMenuItem(value: 5, child: Text('5 s')),
+              DropdownMenuItem(value: 10, child: Text('10 s')),
+            ],
+            onChanged: (v) {
+              if (v == null) return;
+              setState(() => huntSecs = v);
+              if (hunting) toggleHunt(true);
+            },
+          ),
+        ]),
+        const SizedBox(height: 6),
+        TextField(
+          controller: huntCtl,
+          onChanged: (v) => huntTarget = v,
+          decoration: const InputDecoration(
+              labelText: 'IP cherchée (facultatif) : 41.  ou  BF  ou  Orange',
+              border: OutlineInputBorder()),
+        ),
+        const SizedBox(height: 8),
+        if (huntHist.isEmpty)
+          Text('Aucune IP enregistrée pour l\'instant.', style: small)
+        else ...[
+          for (var k = 0; k < huntHist.length && k < 12; k++)
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Text(flagOf(huntHist[k].cc), style: const TextStyle(fontSize: 22)),
+              title: Text(huntHist[k].ip, style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text(
+                  '${huntHist[k].city.isEmpty ? '' : '${huntHist[k].city}, '}${huntHist[k].country}'
+                  '${huntHist[k].isp.isEmpty ? '' : ' • ${huntHist[k].isp}'} • ${_hms(huntHist[k].at)}',
+                  style: small),
+              trailing: k == 0
+                  ? const Text('NOUVELLE',
+                      style: TextStyle(color: Colors.greenAccent, fontSize: 10, fontWeight: FontWeight.bold))
+                  : null,
+              onTap: () {
+                Clipboard.setData(ClipboardData(text: huntHist[k].ip));
+                snack('IP copiée');
+              },
+            ),
+        ],
+        Wrap(spacing: 6, children: [
+          TextButton.icon(
+            onPressed: huntHist.isEmpty
+                ? null
+                : () async {
+                    await Clipboard.setData(ClipboardData(text: huntHist.first.ip));
+                    snack('IP copiée');
+                  },
+            icon: const Icon(Icons.copy, size: 18),
+            label: const Text('Copier la dernière'),
+          ),
+          TextButton.icon(
+            onPressed: () => setState(() => huntHist.clear()),
+            icon: const Icon(Icons.delete_outline, size: 18),
+            label: const Text('Vider'),
+          ),
+        ]),
+      ]),
       journalCard('Connexion en direct', Icons.timeline, [
         ValueListenableBuilder<int>(
           valueListenable: logTick,
@@ -4973,7 +5198,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             richMessage(fillVars(c.cmsg, vars), onLink: openLink),
         ],
       ]),
-      if (bannerOk && banner != null) bannerBox(),
+      if (connected && trafficOk) const AdsBanner(),
       journalCard('Journal en direct', Icons.article_outlined, [
         Wrap(spacing: 6, children: [
           TextButton.icon(
@@ -5155,7 +5380,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           ),
         ]),
       ),
-      if (bannerOk && banner != null) bannerBox(),
+      if (connected && trafficOk) const AdsBanner(),
       const SizedBox(height: 24),
       const Center(
           child: Text('Créé par APPOH GODWIN — HACKER GODWIN',
@@ -5448,7 +5673,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v7.0'),
+          title: Text('OTAKU TUNNEL v7.1'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
