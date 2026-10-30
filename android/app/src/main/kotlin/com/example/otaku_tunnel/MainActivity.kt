@@ -66,6 +66,47 @@ class MainActivity : FlutterActivity() {
                 "nativeDir" -> {
                     result.success(applicationInfo.nativeLibraryDir)
                 }
+                "netInfo" -> {
+                    val out = HashMap<String, Any>()
+                    val nets = ArrayList<Map<String, String>>()
+                    try {
+                        val cm = getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+                        val activeNet = cm.activeNetwork
+                        for (n in cm.allNetworks) {
+                            val caps = cm.getNetworkCapabilities(n) ?: continue
+                            val lp = cm.getLinkProperties(n)
+                            val t = ArrayList<String>()
+                            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) t.add("Wi-Fi")
+                            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)) t.add("Données mobiles")
+                            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)) t.add("Ethernet")
+                            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) t.add("VPN")
+                            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_BLUETOOTH)) t.add("Bluetooth")
+                            val addrs = ArrayList<String>()
+                            if (lp != null) {
+                                for (la in lp.linkAddresses) {
+                                    val h = la.address.hostAddress
+                                    if (h != null && !h.contains(":")) addrs.add(h)
+                                }
+                            }
+                            nets.add(mapOf(
+                                "type" to t.joinToString(" + "),
+                                "iface" to (lp?.interfaceName ?: ""),
+                                "addrs" to addrs.joinToString(", "),
+                                "active" to (n == activeNet).toString()
+                            ))
+                        }
+                    } catch (e: Throwable) {
+                    }
+                    out["nets"] = nets
+                    try {
+                        val tm = getSystemService(android.content.Context.TELEPHONY_SERVICE) as android.telephony.TelephonyManager
+                        out["operator"] = tm.networkOperatorName ?: ""
+                        out["sim"] = tm.simOperatorName ?: ""
+                        out["plmn"] = tm.networkOperator ?: ""
+                    } catch (e: Throwable) {
+                    }
+                    result.success(out)
+                }
                 else -> result.notImplemented()
             }
         }

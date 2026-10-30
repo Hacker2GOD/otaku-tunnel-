@@ -1491,6 +1491,12 @@ class SshTunnel {
 }
 
 // ---------- Messages : HTML simple + variables (aucun script n'est jamais exécuté) ----------
+class LocalIp {
+  final String ip, iface;
+  final DateTime at;
+  LocalIp(this.ip, this.iface, this.at);
+}
+
 class IpInfo {
   final String ip, country, cc, city, region, isp, tz;
   final DateTime at;
@@ -2571,11 +2577,15 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   bool hotspot = false;
   SshTunnel? sshT;
   Process? dnsProc;
-  bool hunting = false, huntBusy = false;
-  int huntSecs = 5;
+  bool hunting = false, huntBusy = false, onlyMobile = false;
+  int huntSecs = 2, jtab = 0;
   String huntTarget = '', huntStatus = 'Arrêté';
+  String netOperator = '', netSim = '', netPlmn = '';
   Timer? _huntTimer;
-  final List<IpInfo> huntHist = [];
+  final List<LocalIp> localHist = [];
+  final Map<String, String> huntLast = {};
+  Map<String, String> localNow = {};
+  List<Map<String, String>> netNets = [];
   final TextEditingController huntCtl = TextEditingController();
   bool sshBusy = false;
   bool preResolve = true, autoHost = true;
@@ -4172,11 +4182,21 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       if (n != null && n.isNotEmpty) k.name = n;
     }
     if (!mounted) return;
+    final gi = out.indexWhere((k) => k.id == 'c07');
+    if (gi > 0) out.insert(0, out.removeAt(gi));
+    var migrate = false;
+    if (p.getBool('skinMig711') != true) {
+      migrate = true;
+      await p.setBool('skinMig711', true);
+    }
+    if (!mounted) return;
     setState(() {
       skins = out;
       skinNames = names;
+      if (migrate && skinId == 'classic' && gi >= 0) skinId = 'c07';
       if (skinId != 'classic' && !out.any((k) => k.id == skinId)) skinId = 'classic';
     });
+    if (migrate) await p.setString('skinId', skinId);
   }
 
   Future<void> _saveSkins() async {
@@ -4829,76 +4849,49 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   }
 
   // Après « Connecté » : on vérifie que le trafic passe vraiment (recherche d'IP à travers le tunnel).
-  // ----- Chasseur d'IP : mode avion / données mobiles -----
+  // ----- Chasseur d'IP (comme SSH Custom) : suit l'adresse IP locale du réseau -----
   String _hms(DateTime d) =>
       '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}:${d.second.toString().padLeft(2, '0')}';
 
-  Future<String?> _quickIp() async {
-    for (final u in const ['https://api.ipify.org?format=json', 'https://ipv4.icanhazip.com']) {
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 4);
-      try {
-        final req = await client.getUrl(Uri.parse(u)).timeout(const Duration(seconds: 4));
-        final res = await req.close().timeout(const Duration(seconds: 4));
-        if (res.statusCode != 200) continue;
-        final body = (await res.transform(utf8.decoder).join().timeout(const Duration(seconds: 4))).trim();
-        final ip = body.startsWith('{') ? '${(jsonDecode(body) as Map)['ip'] ?? ''}' : body;
-        if (RegExp(r'^[0-9a-fA-F:.]{3,45}$').hasMatch(ip)) return ip;
-      } catch (_) {
-      } finally {
-        client.close(force: true);
+  bool _isMobileIface(String n) =>
+      RegExp(r'rmnet|ccmni|pdp|wwan|ppp|seth|usb').hasMatch(n.toLowerCase());
+
+  // Lit le réseau actuel : interfaces (Dart) + type de réseau et opérateur (Android).
+  Future<void> refreshNet() async {
+    try {
+      final list = await NetworkInterface.list(includeLoopback: false, type: InternetAddressType.IPv4);
+      final cur = <String, String>{};
+      for (final ni in list) {
+        for (final a in ni.addresses) {
+          cur[ni.name] = a.address;
+        }
       }
-    }
-    return null;
+      if (mounted) setState(() => localNow = cur);
+    } catch (_) {}
+    try {
+      final r = await kChan.invokeMethod<Map>('netInfo');
+      if (r == null || !mounted) return;
+      final nets = <Map<String, String>>[];
+      for (final e in (r['nets'] as List? ?? [])) {
+        nets.add((e as Map).map((k, v) => MapEntry('$k', '$v')));
+      }
+      setState(() {
+        netNets = nets;
+        netOperator = '${r['operator'] ?? ''}';
+        netSim = '${r['sim'] ?? ''}';
+        netPlmn = '${r['plmn'] ?? ''}';
+      });
+    } catch (_) {}
   }
 
-  Future<IpInfo> _lookupFor(String ip) async {
-    for (final u in [
-      'https://ipwho.is/$ip',
-      'http://ip-api.com/json/$ip?fields=status,country,countryCode,regionName,city,isp,query,timezone',
-    ]) {
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
-      try {
-        final req = await client.getUrl(Uri.parse(u)).timeout(const Duration(seconds: 6));
-        final res = await req.close().timeout(const Duration(seconds: 6));
-        if (res.statusCode != 200) continue;
-        final body = await res.transform(utf8.decoder).join().timeout(const Duration(seconds: 6));
-        final j = jsonDecode(body) as Map<String, dynamic>;
-        String s(dynamic v) => v == null ? '' : '$v';
-        final conn = j['connection'];
-        final tzv = j['timezone'];
-        if (j['success'] == false || j['status'] == 'fail') continue;
-        return IpInfo(
-          ip,
-          s(j['country_name'] ?? j['country']),
-          s(j['country_code'] ?? j['countryCode']),
-          s(j['city']),
-          s(j['region'] ?? j['regionName']),
-          s(conn is Map ? conn['isp'] : (j['isp'] ?? j['org'])),
-          s(tzv is Map ? tzv['id'] : tzv),
-          DateTime.now(),
-        );
-      } catch (_) {
-      } finally {
-        client.close(force: true);
-      }
-    }
-    return IpInfo(ip, '', '', '', '', '', '', DateTime.now());
-  }
-
-  bool _huntMatch(IpInfo i) {
+  bool _huntMatch(LocalIp i) {
     final toks = huntTarget
         .split(RegExp(r'[,;\s]+'))
         .map((e) => e.trim().toLowerCase())
         .where((e) => e.isNotEmpty)
         .toList();
     for (final t in toks) {
-      if (i.ip.toLowerCase().startsWith(t) ||
-          i.cc.toLowerCase() == t ||
-          i.country.toLowerCase().contains(t) ||
-          i.city.toLowerCase().contains(t) ||
-          i.isp.toLowerCase().contains(t)) {
-        return true;
-      }
+      if (i.ip.startsWith(t) || i.iface.toLowerCase().contains(t)) return true;
     }
     return false;
   }
@@ -4910,6 +4903,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       huntStatus = on ? 'Chasse en cours...' : 'Arrêté';
     });
     if (on) {
+      huntLast.clear();
       _huntTimer = Timer.periodic(Duration(seconds: huntSecs), (_) => _huntTick());
       _huntTick();
     }
@@ -4919,29 +4913,42 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     if (huntBusy || !hunting) return;
     huntBusy = true;
     try {
-      final ip = await _quickIp();
+      final list = await NetworkInterface.list(includeLoopback: false, type: InternetAddressType.IPv4);
+      final cur = <String, String>{};
+      for (final ni in list) {
+        if (onlyMobile && !_isMobileIface(ni.name)) continue;
+        for (final a in ni.addresses) {
+          cur[ni.name] = a.address;
+        }
+      }
       if (!mounted || !hunting) return;
-      if (ip == null) {
-        setState(() => huntStatus = 'Pas de réseau (mode avion ?)');
+      refreshNet();
+      if (cur.isEmpty) {
+        huntLast.clear();
+        setState(() => huntStatus = 'Aucun réseau (mode avion ?)');
         return;
       }
-      if (huntHist.isNotEmpty && huntHist.first.ip == ip) {
-        setState(() => huntStatus = 'Même IP : $ip');
-        return;
+      LocalIp? hit;
+      var added = false;
+      for (final e in cur.entries) {
+        if (huntLast[e.key] == e.value) continue;
+        huntLast[e.key] = e.value;
+        final it = LocalIp(e.value, e.key, DateTime.now());
+        localHist.insert(0, it);
+        added = true;
+        if (hit == null && huntTarget.trim().isNotEmpty && _huntMatch(it)) hit = it;
       }
-      setState(() => huntStatus = 'Nouvelle IP : $ip');
-      final info = await _lookupFor(ip);
-      if (!mounted) return;
-      setState(() {
-        huntHist.insert(0, info);
-        if (huntHist.length > 60) huntHist.removeLast();
-      });
-      log('Chasseur : nouvelle IP $ip (${info.country})');
-      if (_huntMatch(info)) {
+      huntLast.removeWhere((k, v) => !cur.containsKey(k));
+      if (localHist.length > 200) localHist.removeRange(200, localHist.length);
+      setState(() => huntStatus =
+          added ? 'Nouvelle IP : ${localHist.first.ip}' : 'Même IP : ${cur.values.first}');
+      if (added) log('Chasseur : IP ${localHist.first.ip} (${localHist.first.iface})');
+      if (hit != null) {
+        final h = hit;
         _huntTimer?.cancel();
         setState(() {
           hunting = false;
-          huntStatus = 'IP trouvée : $ip';
+          huntStatus = 'IP trouvée : ${h.ip}';
         });
         HapticFeedback.heavyImpact();
         showDialog(
@@ -4949,15 +4956,15 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           builder: (ctx) => AlertDialog(
             title: const Text('IP trouvée !'),
             content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-              SelectableText(ip, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+              SelectableText(h.ip, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
               const SizedBox(height: 6),
-              Text('${info.city.isEmpty ? '' : '${info.city}, '}${info.country}'),
-              if (info.isp.isNotEmpty) Text(info.isp),
+              Text('Interface : ${h.iface}'),
+              Text('Heure : ${_hms(h.at)}'),
             ]),
             actions: [
               TextButton(
                 onPressed: () async {
-                  await Clipboard.setData(ClipboardData(text: ip));
+                  await Clipboard.setData(ClipboardData(text: h.ip));
                   snack('IP copiée');
                 },
                 child: const Text('Copier'),
@@ -5064,6 +5071,22 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
       ]),
       const SizedBox(height: 8),
+      Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: SegmentedButton<int>(
+          showSelectedIcon: false,
+          segments: const [
+            ButtonSegment(value: 0, label: Text('Journal'), icon: Icon(Icons.article_outlined)),
+            ButtonSegment(value: 1, label: Text('Chasseur d\'IP'), icon: Icon(Icons.radar)),
+          ],
+          selected: {jtab},
+          onSelectionChanged: (v) {
+            setState(() => jtab = v.first);
+            if (v.first == 1) refreshNet();
+          },
+        ),
+      ),
+      if (jtab == 0) ...[
       journalCard('Mon IP et ma position', Icons.public, [
         if (ip == null)
           Text(ipLoading ? 'Recherche de ton adresse IP...' : 'Adresse IP inconnue. Touche actualiser.',
@@ -5090,85 +5113,6 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         const SizedBox(height: 8),
         Text('Position approximative d\'après l\'adresse IP, donnée par un service en ligne.',
             style: small),
-      ]),
-      journalCard('Chasseur d\'IP', Icons.radar, [
-        Text(
-            'Active le mode avion puis désactive-le (ou coupe et réactive les données mobiles) : '
-            'une nouvelle IP apparaît ici. Coupe le VPN pour voir l\'IP de ton opérateur.',
-            style: small),
-        SwitchListTile(
-          contentPadding: EdgeInsets.zero,
-          title: const Text('Chasse active'),
-          subtitle: Text(huntStatus),
-          value: hunting,
-          onChanged: toggleHunt,
-        ),
-        Row(children: [
-          const Text('Vérifier toutes les'),
-          const SizedBox(width: 10),
-          DropdownButton<int>(
-            value: huntSecs,
-            items: const [
-              DropdownMenuItem(value: 3, child: Text('3 s')),
-              DropdownMenuItem(value: 5, child: Text('5 s')),
-              DropdownMenuItem(value: 10, child: Text('10 s')),
-            ],
-            onChanged: (v) {
-              if (v == null) return;
-              setState(() => huntSecs = v);
-              if (hunting) toggleHunt(true);
-            },
-          ),
-        ]),
-        const SizedBox(height: 6),
-        TextField(
-          controller: huntCtl,
-          onChanged: (v) => huntTarget = v,
-          decoration: const InputDecoration(
-              labelText: 'IP cherchée (facultatif) : 41.  ou  BF  ou  Orange',
-              border: OutlineInputBorder()),
-        ),
-        const SizedBox(height: 8),
-        if (huntHist.isEmpty)
-          Text('Aucune IP enregistrée pour l\'instant.', style: small)
-        else ...[
-          for (var k = 0; k < huntHist.length && k < 12; k++)
-            ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              leading: Text(flagOf(huntHist[k].cc), style: const TextStyle(fontSize: 22)),
-              title: Text(huntHist[k].ip, style: const TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: Text(
-                  '${huntHist[k].city.isEmpty ? '' : '${huntHist[k].city}, '}${huntHist[k].country}'
-                  '${huntHist[k].isp.isEmpty ? '' : ' • ${huntHist[k].isp}'} • ${_hms(huntHist[k].at)}',
-                  style: small),
-              trailing: k == 0
-                  ? const Text('NOUVELLE',
-                      style: TextStyle(color: Colors.greenAccent, fontSize: 10, fontWeight: FontWeight.bold))
-                  : null,
-              onTap: () {
-                Clipboard.setData(ClipboardData(text: huntHist[k].ip));
-                snack('IP copiée');
-              },
-            ),
-        ],
-        Wrap(spacing: 6, children: [
-          TextButton.icon(
-            onPressed: huntHist.isEmpty
-                ? null
-                : () async {
-                    await Clipboard.setData(ClipboardData(text: huntHist.first.ip));
-                    snack('IP copiée');
-                  },
-            icon: const Icon(Icons.copy, size: 18),
-            label: const Text('Copier la dernière'),
-          ),
-          TextButton.icon(
-            onPressed: () => setState(() => huntHist.clear()),
-            icon: const Icon(Icons.delete_outline, size: 18),
-            label: const Text('Vider'),
-          ),
-        ]),
       ]),
       journalCard('Connexion en direct', Icons.timeline, [
         ValueListenableBuilder<int>(
@@ -5244,6 +5188,144 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           },
         ),
       ]),
+      ] else ...[
+        journalCard('Réseau auquel tu es connecté', Icons.network_check, [
+          Builder(builder: (_) {
+            final act = netNets.where((n) => n['active'] == 'true').toList();
+            final a = act.isNotEmpty ? act.first : (netNets.isNotEmpty ? netNets.first : null);
+            final mobile = (a?['type'] ?? '').contains('mobile');
+            final wifi = (a?['type'] ?? '').contains('Wi-Fi');
+            return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Icon(mobile ? Icons.signal_cellular_alt : (wifi ? Icons.wifi : Icons.lan), color: Colors.greenAccent),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(a == null ? (localNow.isEmpty ? 'Aucun réseau' : 'Réseau détecté') : (a['type'] ?? '—'),
+                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                ),
+              ]),
+              const SizedBox(height: 6),
+              if (netOperator.isNotEmpty)
+                Text('Opérateur : $netOperator${netPlmn.isEmpty ? '' : ' ($netPlmn)'}'),
+              if (netSim.isNotEmpty && netSim != netOperator) Text('Carte SIM : $netSim', style: small),
+              if (a != null)
+                Text('Interface : ${a['iface']}  •  IP locale : ${a['addrs']}', style: small)
+              else
+                for (final e in localNow.entries) Text('${e.key} : ${e.value}', style: small),
+              for (final n in netNets)
+                if (n != a)
+                  Text('Autre : ${n['type']} • ${n['iface']} • ${n['addrs']}', style: small),
+              const SizedBox(height: 6),
+              Text(
+                  ipNow == null
+                      ? 'IP publique : inconnue (onglet Journal > actualiser)'
+                      : 'IP publique : ${ipNow!.ip} (${ipNow!.country})',
+                  style: small),
+              TextButton.icon(
+                onPressed: refreshNet,
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('Actualiser le réseau'),
+              ),
+            ]);
+          }),
+        ]),
+        journalCard('Chasseur d\'IP', Icons.radar, [
+          Text(
+              'Comme SSH Custom : active la chasse, puis passe en mode avion et reviens (ou coupe et '
+              'réactive les données mobiles). Chaque nouvelle IP du réseau s\'ajoute à la liste.',
+              style: small),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Chasse active'),
+            subtitle: Text(huntStatus),
+            value: hunting,
+            onChanged: toggleHunt,
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Seulement les données mobiles'),
+            subtitle: const Text('Ignore le Wi-Fi et l\'Ethernet'),
+            value: onlyMobile,
+            onChanged: (v) => setState(() {
+              onlyMobile = v;
+              huntLast.clear();
+            }),
+          ),
+          Row(children: [
+            const Text('Vérifier toutes les'),
+            const SizedBox(width: 10),
+            DropdownButton<int>(
+              value: huntSecs,
+              items: const [
+                DropdownMenuItem(value: 1, child: Text('1 s')),
+                DropdownMenuItem(value: 2, child: Text('2 s')),
+                DropdownMenuItem(value: 3, child: Text('3 s')),
+                DropdownMenuItem(value: 5, child: Text('5 s')),
+              ],
+              onChanged: (v) {
+                if (v == null) return;
+                setState(() => huntSecs = v);
+                if (hunting) toggleHunt(true);
+              },
+            ),
+          ]),
+          const SizedBox(height: 6),
+          TextField(
+            controller: huntCtl,
+            onChanged: (v) => huntTarget = v,
+            decoration: const InputDecoration(
+                labelText: 'IP cherchée (facultatif) : 10.143  ou  10.57.2',
+                border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 8),
+          if (localHist.isEmpty)
+            Text('Aucune IP enregistrée pour l\'instant.', style: small)
+          else
+            for (var k = 0; k < localHist.length && k < 40; k++)
+              InkWell(
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: localHist[k].ip));
+                  snack('IP copiée');
+                },
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: Text(
+                    '[${_hms(localHist[k].at)}] IP Address ${localHist[k].ip}  (${localHist[k].iface})',
+                    style: TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 12.5,
+                      color: (huntTarget.trim().isNotEmpty && _huntMatch(localHist[k]))
+                          ? Colors.greenAccent
+                          : Colors.white,
+                      decoration: TextDecoration.underline,
+                      decorationColor: Colors.white24,
+                    ),
+                  ),
+                ),
+              ),
+          Wrap(spacing: 6, children: [
+            TextButton.icon(
+              onPressed: localHist.isEmpty
+                  ? null
+                  : () async {
+                      await Clipboard.setData(ClipboardData(
+                          text: localHist.map((e) => '[${_hms(e.at)}] IP Address ${e.ip}').join('\n')));
+                      snack('Liste copiée');
+                    },
+              icon: const Icon(Icons.copy, size: 18),
+              label: const Text('Copier la liste'),
+            ),
+            TextButton.icon(
+              onPressed: () => setState(() {
+                localHist.clear();
+                huntLast.clear();
+              }),
+              icon: const Icon(Icons.delete_outline, size: 18),
+              label: const Text('Vider'),
+            ),
+          ]),
+        ]),
+      ],
     ]);
   }
 
@@ -5673,7 +5755,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v7.1'),
+          title: Text('OTAKU TUNNEL v7.1.1'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
