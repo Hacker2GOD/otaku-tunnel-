@@ -4979,6 +4979,24 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     }
   }
 
+  // Petit avertissement de 4 secondes avant une pub (bonne pratique AdMob : pas de pub par surprise).
+  Future<void> _adWarn() async {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => const AlertDialog(
+        content: Row(children: [
+          CircularProgressIndicator(),
+          SizedBox(width: 16),
+          Expanded(child: Text('Une courte pub vidéo va démarrer...')),
+        ]),
+      ),
+    );
+    await Future.delayed(const Duration(seconds: 4));
+    if (mounted) Navigator.of(context, rootNavigator: true).pop();
+  }
+
   Future<void> _afterConnected() async {
     setStep(3, 1);
     for (var k = 0; k < 4 && connected; k++) {
@@ -4990,7 +5008,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         setStep(3, 2);
         setStep(4, 2);
         log('Trafic OK : IP ${r.ip} (${r.country})');
-        adsAfterConnect(() => mounted && connected, log);
+        adsAfterConnect(() => mounted && connected, log, warn: _adWarn);
         if (mounted) {
           final c = configs.isEmpty ? null : configs[sel];
           if (c != null && c.cmsg.trim().isNotEmpty) {
@@ -5755,7 +5773,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         ),
         const Divider(),
         const ListTile(
-          title: Text('OTAKU TUNNEL v7.1.1'),
+          title: Text('OTAKU TUNNEL v7.1.3'),
           subtitle: Text('Créé par APPOH GODWIN • alias HACKER GODWIN'),
         ),
       ]);
