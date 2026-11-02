@@ -3,7 +3,7 @@ import 'package:flutter/widgets.dart';
 import 'package:startapp_sdk/startapp.dart';
 
 // true = pubs de TEST (aucun gain). Le script startio.sh passe à false avec l'option "prod".
-const kStartTest = true;
+const kStartTest = false;
 
 // Une pub plein écran/vidéo à la connexion, puis au plus une toutes les 30 minutes.
 const _gap = Duration(minutes: 30);
